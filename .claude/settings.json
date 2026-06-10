@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/bin/python:*)",
+      "Bash(venv/bin/pip:*)",
+      "Bash(mkdir:*)",
+      "Read(solutions/**)",
+      "Write(solutions/**)",
+      "Edit(solutions/**)"
+    ]
+  }
+}
