@@ -11,9 +11,19 @@ Best automated route: **24:45:00**, visiting all **472** stations (valid, in
 | Greedy (nearest-unvisited) | 30:08:00 |
 | Multi-start + tail simulated annealing | 28:10:30 |
 | Time-dependent LNS (ruin + regret-2 recreate + SA, iterated) | 26:42:00 |
-| **+ dead-end "running" between terminals** (curated terminal-runs) | **24:45:00** |
-| — proven lower bound (Rural Postman, runs allowed) | 22:01:18 |
+| **+ dead-end running between terminals** | **24:45:00** |
+| — lower bound (Rural Postman, this run model) | 22:01:18 |
 | — current human world record (Kate Jones, 2023, 472 stns) | 22:14:10 |
+
+**Run model, calibrated against the record.** Running between nearby dead-end
+terminals is the key second-act lever (`--terminal-runs`). The committed model
+(10.8 km/h, 60 s/end) has a lower bound of **22:01:18**, *below* the human record
+(22:14) — i.e. consistent with what record-holders actually do (they run hard).
+A stricter "realistic" model (9 km/h, 120 s/end, 1.5 km cap) was tested but
+rejected: its lower bound (22:22) *exceeds* the record, proving it forbids a
+route a human achieved. So the lenient model is the defensible one. (It does let
+the optimizer use a few long runs; tune `DEFAULT_PACE_MPS` / `DEFAULT_RUN_MAX_METERS`
+in `walk_transfers.py` to taste — the validator and optimizer share the setting.)
 
 The lower bound comes from reducing the network to its 143 decision nodes / 554
 track segments and solving the odd-degree (Rural-Postman) matching. Geometric-

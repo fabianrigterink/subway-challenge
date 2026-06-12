@@ -51,8 +51,13 @@ GOOGLE_PRICE_PER_ELEMENT = 0.005
 # profile's speed.
 DEFAULT_OSRM_HOST = "http://router.project-osrm.org"
 DEFAULT_OSRM_PROFILE = "driving"
-DEFAULT_PACE_MPS = 3.0          # ~10.8 km/h running pace
-DEFAULT_ACCESS_PENALTY_S = 60   # per-end station ingress/egress not in street time
+# Run model. Lenient settings (committed): consistent with real record-holders,
+# whose aggressive running puts the record (22:14) above this model's lower bound
+# (22:01). A stricter model (2.5 m/s, 1.5 km cap) was tried but its lower bound
+# (22:22) exceeded the record -- i.e. provably too strict -- so it was rejected.
+DEFAULT_PACE_MPS = 3.0          # ~10.8 km/h
+DEFAULT_ACCESS_PENALTY_S = 60   # per-end station ingress/egress
+DEFAULT_RUN_MAX_METERS = None   # no single-run distance cap
 DEFAULT_RUN_RADIUS_M = 5000.0
 
 DEFAULT_GTFS = Path("data/gtfs")
@@ -352,7 +357,8 @@ def osrm_full_matrix(coords, host=DEFAULT_OSRM_HOST, profile=DEFAULT_OSRM_PROFIL
 
 def complex_run_adjacency(radius_m=DEFAULT_RUN_RADIUS_M, pace_mps=DEFAULT_PACE_MPS,
                           access_penalty_s=DEFAULT_ACCESS_PENALTY_S, min_seconds=0,
-                          max_seconds=None, host=DEFAULT_OSRM_HOST,
+                          max_seconds=None, max_meters=DEFAULT_RUN_MAX_METERS,
+                          host=DEFAULT_OSRM_HOST,
                           profile=DEFAULT_OSRM_PROFILE, gtfs_dir=DEFAULT_GTFS):
     """Complex-to-complex run adjacency within ``radius_m``: returns
     ``(adjacency, complexes)`` where adjacency[cid] = [(other_cid, seconds), ...].
@@ -384,6 +390,8 @@ def complex_run_adjacency(radius_m=DEFAULT_RUN_RADIUS_M, pace_mps=DEFAULT_PACE_M
             if not cands:
                 continue
             meters = int(round(min(cands)))
+            if max_meters is not None and meters > max_meters:   # no marathon sprints
+                continue
             secs = max(int(round(min(cands) / pace_mps)) + access_penalty_s, min_seconds)
             if max_seconds is not None and secs > max_seconds:
                 continue

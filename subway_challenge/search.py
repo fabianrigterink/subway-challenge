@@ -217,11 +217,18 @@ def realize(adj, tables, canonical, start_node, anchors):
     return path, node_t[current] - node_t[start_node]
 
 
-def _dijkstra_to_station_capped(adj, node_off, src, target_station, cap, runs=None):
+def _dijkstra_to_station_capped(adj, node_off, src, target_station, cap, runs=None,
+                                visited=None, cov_reward=0.0):
+    """Earliest-arrival to ``target_station`` (capped). If ``cov_reward>0``, the
+    search cost is reduced for edges entering still-unvisited stations, so it
+    prefers paths that sweep up free coverage en route (coverage-aware routing).
+    The returned node's real time is the actual arrival; only the *search* cost
+    is biased."""
     dist = {src: 0.0}
     prev = {}
     pq = [(0.0, src)]
     popped = 0
+    cover = cov_reward and visited is not None
     while pq:
         d, u = heapq.heappop(pq)
         if d > dist.get(u, INF):
@@ -232,14 +239,20 @@ def _dijkstra_to_station_capped(adj, node_off, src, target_station, cap, runs=No
         if u != src and node_off[u] == target_station:
             return u, prev
         for v, ed in adj[u].items():
-            nd = d + ed["weight"]
+            c = ed["weight"]
+            if cover and node_off[v] not in visited:
+                c = max(1.0, c - cov_reward)
+            nd = d + c
             if nd < dist.get(v, INF):
                 dist[v] = nd
                 prev[v] = u
                 heapq.heappush(pq, (nd, v))
         if runs is not None:                         # out-of-system run shortcuts
             for v, w, _info in runs.run_successors(u):
-                nd = d + w
+                c = w
+                if cover and node_off[v] not in visited:
+                    c = max(1.0, w - cov_reward)
+                nd = d + c
                 if nd < dist.get(v, INF):
                     dist[v] = nd
                     prev[v] = u
@@ -247,19 +260,25 @@ def _dijkstra_to_station_capped(adj, node_off, src, target_station, cap, runs=No
     return None, prev
 
 
-def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None):
+def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None,
+                 with_arrivals=False, cov_reward=0.0):
     """Realize anchors starting from node ``current`` with ``visited0`` already
     covered. Returns (suffix_path_nodes, end_node, visited) or (None, None, None).
-    With ``runs``, the realizer may use out-of-system run/walk shortcuts."""
-    node_off = tables[0]
+    With ``runs``, the realizer may use out-of-system run/walk shortcuts. With
+    ``with_arrivals``, also returns `arrivals` = [(anchor_index, station, arrival_t)]
+    for anchors actually targeted. With ``cov_reward>0``, leg routing is
+    coverage-aware (sweeps free unvisited stations en route)."""
+    node_off, _stop, node_t = tables
     visited = set(visited0)
     suffix = []
-    for a in anchors:
+    arrivals = []
+    for idx, a in enumerate(anchors):
         if a in visited:
             continue
-        tgt, prev = _dijkstra_to_station_capped(adj, node_off, current, a, cap, runs)
+        tgt, prev = _dijkstra_to_station_capped(adj, node_off, current, a, cap, runs,
+                                                visited, cov_reward)
         if tgt is None:
-            return None, None, None
+            return (None, None, None, None) if with_arrivals else (None, None, None)
         seg = []
         x = tgt
         while x != current:
@@ -269,6 +288,9 @@ def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None)
             suffix.append(nid)
             visited.add(node_off[nid])
         current = tgt
+        arrivals.append((idx, a, node_t[current]))
+    if with_arrivals:
+        return suffix, current, visited, arrivals
     return suffix, current, visited
 
 
@@ -590,7 +612,7 @@ def regret_insert(order, removed, D, rng=None, jitter=0.0):
 
 def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp,
             tend_temp, seed, jitter=0.15, anchors=None, runs=None, coords=None,
-            cluster_frac=0.4):
+            cluster_frac=0.4, cost_frac=0.0, cov_reward=0.0):
     """One LNS run (ruin + randomized-regret recreate + SA) from snode. If
     `anchors` is given, seed from them (iterated LNS); else from greedy. With
     `runs`, the realizer may use out-of-system run/walk shortcuts. Returns
@@ -604,9 +626,9 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
         _, anchors, _ = greedy_anchors(adj, tables, canonical, snode)
     p = int(len(anchors) * split)
     prefix_anchors, tail = anchors[:p], anchors[p:]
-    pre_suffix, pre_end, pre_visited = realize_from(adj, tables, snode, {node_off[snode]}, prefix_anchors, runs=runs)
+    pre_suffix, pre_end, pre_visited = realize_from(adj, tables, snode, {node_off[snode]}, prefix_anchors, runs=runs, cov_reward=cov_reward)
     prefix_path = [snode] + pre_suffix
-    base_path, end, _ = realize_from(adj, tables, pre_end, pre_visited, tail, runs=runs)
+    base_path, end, _, cur_arr = realize_from(adj, tables, pre_end, pre_visited, tail, runs=runs, with_arrivals=True, cov_reward=cov_reward)
     cur_tail, cur_e = tail[:], node_t[end] - start_t
     best_tail, best_e, best_path = tail[:], cur_e, base_path
     rng = random.Random(seed)
@@ -614,7 +636,23 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
     while time.time() - t0 < budget and len(tail) > 4:
         frac = (time.time() - t0) / budget
         T = t0_temp * (tend_temp / t0_temp) ** frac
-        if coords is not None and rng.random() < cluster_frac:
+        r = rng.random()
+        if cost_frac and cur_arr and r < cost_frac:
+            # cost-targeted ruin: tear out a window centered on a high-friction leg
+            fric = []
+            for k in range(1, len(cur_arr)):
+                _, a0, t0a = cur_arr[k - 1]
+                ik, a1, t1a = cur_arr[k]
+                fric.append((max(0.0, (t1a - t0a) - D[a0].get(a1, 0.0)), ik))
+            tot = sum(f for f, _ in fric)
+            if tot <= 0:
+                continue
+            center = rng.choices([i for _, i in fric], weights=[f for f, _ in fric], k=1)[0]
+            W = rng.randint(wmin, wmax)
+            lo, hi = max(0, center - W // 2), min(len(cur_tail), center + W // 2 + 1)
+            removed = cur_tail[lo:hi]
+            kept = cur_tail[:lo] + cur_tail[hi:]
+        elif coords is not None and r < cost_frac + cluster_frac:
             # geographic-cluster ruin: tear out all tail anchors near a random center
             center = cur_tail[rng.randrange(len(cur_tail))]
             if center not in coords:
@@ -635,12 +673,13 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
         if not removed or not kept:
             continue
         cand = regret_insert(kept, removed, D, rng, jitter)
-        tp, tend, tvis = realize_from(adj, tables, pre_end, pre_visited, cand, runs=runs)
+        tp, tend, tvis, arr = realize_from(adj, tables, pre_end, pre_visited, cand,
+                                           runs=runs, with_arrivals=True, cov_reward=cov_reward)
         if tp is None or len(tvis & canonical) < len(canonical):
             continue
         e = node_t[tend] - start_t
         if e - cur_e < 0 or rng.random() < math.exp(-(e - cur_e) / T):
-            cur_tail, cur_e = cand, e
+            cur_tail, cur_e, cur_arr = cand, e, arr
             if e < best_e:
                 best_tail, best_e, best_path = cand, e, tp
     return prefix_path + best_path, best_e
@@ -725,7 +764,8 @@ def cmd_lns(args) -> int:
         snode = min(cands, key=lambda n: node_t[n])
         full, e = lns_run(G._adj, tables, si.canonical_stations, D, snode, sp,
                           args.wmin, args.wmax, per, args.t0, args.tend, sd,
-                          anchors=seed_anchors, runs=runs, coords=coords)
+                          anchors=seed_anchors, runs=runs, coords=coords,
+                          cost_frac=args.cost_ruin, cov_reward=args.cov_reward)
         if full and e < best[0]:
             best = (e, full, (st, sp, sd))
             print(f"  new best {hms(e)} from start={st} split={sp} seed={sd}")
@@ -1115,6 +1155,8 @@ def main(argv=None) -> int:
     ln.add_argument("--use-runs", action="store_true", help="Allow run shortcuts from ALL stations.")
     ln.add_argument("--terminal-runs", action="store_true", help="Allow runs only FROM dead-end terminals (high-value).")
     ln.add_argument("--cluster-ruin", action="store_true", help="Also ruin whole geographic regions, not just order slices.")
+    ln.add_argument("--cost-ruin", type=float, default=0.0, help="Fraction of moves that ruin high-friction legs (e.g. 0.4).")
+    ln.add_argument("--cov-reward", type=float, default=0.0, help="Coverage-aware routing reward (sec) per unvisited station en route (e.g. 60).")
     ln.add_argument("--run-radius", type=float, default=1500, help="Max run distance (m) for runs.")
     ln.add_argument("--wmin", type=int, default=3)
     ln.add_argument("--wmax", type=int, default=18)
