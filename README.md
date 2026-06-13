@@ -38,16 +38,22 @@ plus a run-aware recreate metric.
 
 ### Solver / search
 
+The optimizer is **time-dependent LNS** (ruin a window of the visit order →
+regret-2 recreate → simulated-annealing accept), with out-of-system **runs**
+between dead-end terminals and a run-aware recreate metric. Iterate by seeding
+from the current best.
+
 ```bash
 python -m subway_challenge.solver best                          # score the best route
-python -m subway_challenge.search greedy                        # baseline construction
 python -m subway_challenge.search lns --seed-from solutions/best.json \
-    --splits 0.2,0.35,0.5 --seeds 4                             # iterated LNS (the optimizer)
+    --terminal-runs --run-radius 2500 --seeds 6                 # iterated LNS (the optimizer)
+python -m subway_challenge.solver validate <file> --record      # score/record any candidate
 ```
 
-Other `search.py` commands: `multi`, `grasp`, `optimize-tail`, `tsp`, `sweep`,
-`portfolio`, `postman`. Validate/record any candidate with
-`solver.py validate <file> --record`.
+`search.py` exposes the single `lns` command; the greedy construction it seeds
+from is built in automatically. (Many other heuristics — multi-start, GRASP,
+TSP-order, postman/Euler, etc. — were tried during development and discarded;
+LNS + terminal-runs is what produced `best.json`.)
 
 ## Setup
 
@@ -116,57 +122,32 @@ idx.canonical_stations                        # frozenset of all 472
 `Station ID` (472) = one physical station; `Complex ID` (424) = one fare-controlled
 complex (Times Sq etc.) — we use Station ID as identity, not Complex ID.
 
-**4. Out-of-system walk/run transfers** (`walk_transfers.py`)
+**4. Run distances** (`walk_transfers.py`) — computed automatically on first use
 
-Links between nearby *complexes* not connected by GTFS, for walking/running
-between stations. Default backend is **hosted OSRM** (free, the public demo):
-the full complex-to-complex street-distance matrix is fetched once (~80 batched
-`table` calls, cached to `data/walk/osrm_matrix.json`), then any radius is
-derived instantly. Street distance is symmetrized (one-way bias) and converted
-to time with a **running pace** plus a per-end access penalty — we use OSRM's
-*distance*, not the driving profile's speed.
+Out-of-system street distances between station complexes, for running between
+stations. The full complex-to-complex matrix is fetched once from the public
+**OSRM** demo server (~80 batched `table` calls) and cached to
+`data/walk/osrm_matrix.json`; thereafter it's free. `complex_run_adjacency`
+turns it into `{complex: [(other, seconds, meters)]}`, converting street distance
+to time via a running pace + per-end access penalty (see the run-model note in
+Results). This needs the MTA station/entrance datasets (auto-downloaded by
+`stations.py` / on demand). You don't call this module directly — the run layer
+builds on it.
 
-```bash
-python -m subway_challenge.walk_transfers --backend osrm --radius 5000   # -> data/walk/walk_transfers.csv
-python -m subway_challenge.walk_transfers --backend osrm --radius 1000 --pace 3.0 --access-penalty 60
-```
+**5. On-demand run layer** (`run_layer.py`)
 
-Optional precise short-hop backend — **Google**, entrance-to-entrance (MTA
-entrances dataset, `computeRouteMatrix`/`WALK`, cached, ~$8 at radius 400 m):
-
-```bash
-python -m subway_challenge.walk_transfers --estimate                     # price first, no calls
-export GOOGLE_MAPS_API_KEY=...
-python -m subway_challenge.walk_transfers --backend google --radius 400 --k 3
-```
-
-Fold links into the graph as `walk=True` transfers:
-
-```bash
-python -m subway_challenge.build_graph --walk-transfers data/walk/run_1km.csv
-```
-
-**Graph-density caveat:** the builder materializes one transfer edge per source
-train-event per link, so baking runs in scales edges fast (~22M extra at 1 km,
-**~261M at 5 km** — infeasible). Prefer the on-demand layer below; only bake in
-short walks (≤~1 km) if you need a self-contained static graph. Also note the
-OSRM *driving* profile misses pedestrian-only passages (e.g. Park Place↔Fulton
-St reads ~360 m vs the real ~0 m); the Google/entrances path captures those.
-
-**5. On-demand run layer** (`run_layer.py`) — *recommended for the solver*
-
-Rather than baking runs into the graph, the solver queries them live. A run can
-start at any time, so from node `(stop, t)` you may run to any nearby complex,
-arrive at `t + run_seconds`, and board the first train there. Full 5 km coverage,
-**zero static edges**, built in ~5 s from the cached OSRM matrix.
+The solver queries runs live rather than baking them into the graph. A run can
+start at any time, so from node `(stop, t)` you may run to a nearby complex,
+arrive at `t + run_seconds`, and board the first train there — **zero static
+edges**, built in ~5 s from the cached matrix.
 
 ```python
 from subway_challenge.run_layer import RunLayer
-runs = RunLayer.from_graph(G, radius_m=5000)        # pace/access_penalty configurable
+runs = RunLayer.from_graph(G, radius_m=5000)
 for v, weight, info in runs.neighbors(node):        # graph edges + run options, uniform
     ...                                             # info["mode"] == "run" for runs
 ```
 
-`weight` is total elapsed seconds (run + wait for the boarded train). Branching
-is high at 5 km (~64 run targets/complex); the solver should prune runs that
-don't beat the subway alternative.
+`weight` is total elapsed seconds (run + wait for the boarded train). The
+optimizer restricts runs to *dead-end terminals* (`--terminal-runs`) to keep
+branching low — that's the high-value subset (finish a line, run to another).

@@ -97,14 +97,12 @@ def station_of(stop_id: str) -> str:
 class TimeExpandedGraphBuilder:
     def __init__(self, feed: Feed, days: tuple[int, ...] = tuple(range(7)),
                  routes: list[str] | None = None, add_transfers: bool = True,
-                 exclude_routes: tuple[str, ...] = DEFAULT_EXCLUDE_ROUTES,
-                 walk_links: list[tuple[str, str, int]] | None = None):
+                 exclude_routes: tuple[str, ...] = DEFAULT_EXCLUDE_ROUTES):
         self.feed = feed
         self.days = tuple(sorted(days))
         self.routes = set(routes) if routes else None
         self.exclude_routes = set(exclude_routes)
         self.add_transfers = add_transfers
-        self.walk_links = walk_links or []
 
         self.G = nx.DiGraph()
         self._node_id: dict[tuple[str, int], int] = {}
@@ -207,8 +205,8 @@ class TimeExpandedGraphBuilder:
 
     def _transfer_links(self) -> list[tuple[str, str, int, bool]]:
         """Unified (from_parent, to_parent, min_seconds, is_walk) links from
-        GTFS transfers.txt, terminal reversals, and any out-of-system walk links.
-        A walk link is just a transfer whose minimum time is the street-walk time."""
+        GTFS transfers.txt plus terminal reversals. (Out-of-system runs are added
+        on demand by run_layer.py, not baked in here.)"""
         links = []
         self_transfer = set()
         for tr in self.feed.transfers.itertuples(index=False):
@@ -226,9 +224,6 @@ class TimeExpandedGraphBuilder:
         for parent, plats in self._platforms.items():
             if len(plats) >= 2 and parent not in self_transfer:
                 links.append((parent, parent, TERMINAL_REVERSAL_S, False))
-
-        for a, b, secs in self.walk_links:           # precise street walks
-            links.append((a, b, int(secs), True))
         return links
 
     def _add_transfer_edges(self) -> None:
@@ -264,21 +259,13 @@ class TimeExpandedGraphBuilder:
         return times[i] if i < len(times) else times[0]
 
 
-def load_walk_links(path: Path | str) -> list[tuple[str, str, int]]:
-    """Load (from_parent, to_parent, seconds) rows from a walk_transfers CSV."""
-    df = pd.read_csv(path, dtype={"from_parent": str, "to_parent": str})
-    return list(zip(df["from_parent"], df["to_parent"], df["seconds"].astype(int)))
-
-
 def build_time_expanded_graph(gtfs_dir=DEFAULT_GTFS, days=tuple(range(7)),
                               routes=None, add_transfers=True,
-                              exclude_routes=DEFAULT_EXCLUDE_ROUTES,
-                              walk_links=None) -> nx.DiGraph:
+                              exclude_routes=DEFAULT_EXCLUDE_ROUTES) -> nx.DiGraph:
     feed = Feed.load(gtfs_dir)
     G = TimeExpandedGraphBuilder(feed, days=days, routes=routes,
                                  add_transfers=add_transfers,
-                                 exclude_routes=exclude_routes,
-                                 walk_links=walk_links).build()
+                                 exclude_routes=exclude_routes).build()
     print(f"  total: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
     return G
 
@@ -295,8 +282,6 @@ def main(argv: list[str] | None = None) -> int:
                    help="Comma-separated route_ids to drop (default: SI = Staten "
                         "Island Railway, which is disconnected from the subway).")
     p.add_argument("--no-transfers", action="store_true")
-    p.add_argument("--walk-transfers", default=None,
-                   help="CSV of precise walk links (from walk_transfers.py) to add.")
     args = p.parse_args(argv)
 
     if "-" in args.days:
@@ -306,14 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         days = tuple(int(x) for x in args.days.split(","))
     routes = args.routes.split(",") if args.routes else None
     exclude = tuple(r for r in args.exclude_routes.split(",") if r)
-    walk_links = load_walk_links(args.walk_transfers) if args.walk_transfers else None
 
     print(f"Building graph: days={days} routes={routes or 'ALL'} "
-          f"exclude={exclude or 'none'} transfers={not args.no_transfers} "
-          f"walk_links={len(walk_links) if walk_links else 0}")
+          f"exclude={exclude or 'none'} transfers={not args.no_transfers}")
     G = build_time_expanded_graph(args.gtfs, days=days, routes=routes,
                                   add_transfers=not args.no_transfers,
-                                  exclude_routes=exclude, walk_links=walk_links)
+                                  exclude_routes=exclude)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "wb") as f:
