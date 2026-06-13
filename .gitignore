@@ -219,3 +219,5 @@ __marimo__/
 
 # Subway-challenge data artifacts
 data/
+.DS_Store
+*.html
