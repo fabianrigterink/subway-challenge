@@ -217,7 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Subway-challenge data artifacts
+# Subway-challenge generated artifacts
 data/
+reports/
 .DS_Store
 *.html

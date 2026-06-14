@@ -3,8 +3,10 @@ Solving the NYC Subway Challenge using Agents.
 
 ## Results
 
-Best automated route: **24:45:00**, visiting all **472** stations (valid, in
+Best automated route: **24:24:30**, visiting all **472** stations (valid, in
 `solutions/best.json`; check with `python -m subway_challenge.solver best`).
+Exact replay depends on the GTFS/graph cache; see
+[`REPRODUCIBILITY.md`](REPRODUCIBILITY.md) for hashes and rebuild notes.
 
 | Milestone | Time |
 |---|---|
@@ -12,6 +14,7 @@ Best automated route: **24:45:00**, visiting all **472** stations (valid, in
 | Multi-start + tail simulated annealing | 28:10:30 |
 | Time-dependent LNS (ruin + regret-2 recreate + SA, iterated) | 26:42:00 |
 | **+ dead-end running between terminals** | **24:45:00** |
+| Focused LNS / branch-order refinement | **24:24:30** |
 | — lower bound (Rural Postman, this run model) | 22:01:18 |
 | — current human world record (Kate Jones, 2023, 472 stns) | 22:14:10 |
 
@@ -54,6 +57,14 @@ python -m subway_challenge.solver validate <file> --record      # score/record a
 from is built in automatically. (Many other heuristics — multi-start, GRASP,
 TSP-order, postman/Euler, etc. — were tried during development and discarded;
 LNS + terminal-runs is what produced `best.json`.)
+
+### Route summary notebook
+
+`notebooks/subway_route_summary.ipynb` summarizes the curated JSON routes in
+`solutions/` for blog/reporting use: ranked durations, duration by mode, common
+start/end stations, and common start/end times. It uses the local
+`notebooks/blogstyle.py` copy so the notebook still runs when GitHub raw-file
+SSL verification fails.
 
 ## Setup
 

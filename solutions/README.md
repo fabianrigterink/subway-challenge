@@ -4,6 +4,9 @@ Candidate and best-known routes for the Subway Challenge.
 
 * `best.json` — the best valid route so far (written by `solver.py validate
   --record` when a faster valid route is found). Tracked in git.
+* `*_codex.json` / selected `*_probe.json` — curated valid comparison routes
+  kept for the summary notebook and postmortem analysis. These are not an
+  exhaustive search log.
 * `candidate.json` (or any name) — work-in-progress solutions the solver writes
   and validates each turn.
 

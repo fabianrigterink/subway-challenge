@@ -1,106 +1,136 @@
-# Subway Challenge — Codex Mission Brief
+# Subway Challenge - Codex Charter
 
-Goal: find a route that visits all **472 official NYC subway stations** in less
-than **22:14:10** (`80050` seconds), beating Kate Jones's current world record.
+This is the operating brief for Codex in this repository. Treat the checkout as
+a clean starting point for solving the NYC Subway Challenge with the MTA
+schedule data already present in the repo.
 
-The current repo best is **24:45:00** (`89100` seconds), so the required
-improvement is at least **02:30:51**. Do not redefine success around a smaller
-improvement. The mission is complete only when a route validates with:
+## Mission
+
+Find and validate a route that visits all **472 official NYC subway stations**
+in strictly less than **22:14:10**.
+
+That is the bar. Improving the repository baseline is useful, but the mission is
+not complete unless the validated elapsed time is below Kate Jones's `22:14:10`
+benchmark:
 
 ```text
-RESULT valid=true stations=472/472 elapsed_s=<80050
+valid=true
+stations=472/472
+elapsed_s < 80050
+elapsed < 22:14:10
 ```
 
-## Clean Start
+A tie does not count. A heuristic estimate does not count. A partial route does
+not count. Only the full validator decides.
 
-Treat this repo as the starting point. Ignore previous experimental plans,
-helper modules, and generated probe routes unless they are present in the clean
-tree and still prove useful after inspection. Start from the code and data that
-actually exist now.
+## Clean-Start Rule
 
-The authoritative pieces are:
+Start from scratch on every serious solving pass.
 
-| Path | Role |
+Ignore prior conversations, remembered experiments, stale notes, untracked probe
+files, and old helper scripts unless you deliberately inspect and revalidate
+them. The repository and validator are the source of truth, not the search
+history.
+
+Begin by orienting from the current checkout:
+
+```bash
+git status --short
+git ls-files
+venv/bin/python -m subway_challenge.solver best
+```
+
+If the working tree contains dirty or untracked files from earlier attempts,
+leave them alone unless they are directly relevant. Treat them as scratch until
+they have been read, understood, and validated.
+
+## Source Of Truth
+
+Read these files before changing solver behavior:
+
+| Path | Purpose |
 |---|---|
-| `subway_challenge/solver.py` | Validator, scorer, and solution-format contract. |
-| `subway_challenge/search.py` | Current LNS optimizer and best starting solver. |
-| `subway_challenge/build_graph.py` | Builds the time-expanded GTFS graph. |
+| `README.md` | Project overview, baseline, data pipeline, and known commands. |
+| `CLAUDE.md` | Existing solver contract and validation expectations. |
+| `subway_challenge/solver.py` | Validator, scorer, legal moves, and solution format. |
+| `subway_challenge/search.py` | Main search and route-construction entry point. |
+| `subway_challenge/build_graph.py` | GTFS-derived time-expanded graph construction. |
 | `subway_challenge/run_layer.py` | Legal out-of-system run transitions. |
-| `subway_challenge/walk_transfers.py` | Run-distance model and OSRM cache logic. |
+| `subway_challenge/walk_transfers.py` | Run-distance and OSRM model. |
 | `subway_challenge/stations.py` | Official 472-station identity mapping. |
-| `solutions/best.json` | Current best valid route. |
+| `solutions/best.json` | Current best route, trusted only after validation. |
 
-Do not assume any untracked or previously discussed helper exists. If a new
-planning layer is needed, build it deliberately, keep it scoped, and validate
-its output through `solver.py`.
+Do not weaken the validator, station identity mapping, legal move model, or
+elapsed-time scoring to make a route pass. Improve the route, not the rules.
 
-## Non-Negotiable Validation
+## Validation Contract
 
-Every serious candidate must be checked with the full validator:
+Every meaningful candidate must be validated on the full graph:
 
 ```bash
 venv/bin/python -m subway_challenge.solver validate solutions/candidate.json --record
 ```
 
-Always surface the `RESULT` line. A planning score, compact-graph score, visual
-inspection, or plausible itinerary does not count unless the full validator says
-the route is valid.
+Always surface the complete `RESULT` line. `--record` may update
+`solutions/best.json`, but only when the candidate is valid and faster than the
+current recorded best.
 
-Current baseline command:
-
-```bash
-venv/bin/python -m subway_challenge.solver best
-# expected current baseline: elapsed_s=89100 elapsed=24:45:00
-```
-
-`solutions/best.json` should change only through `--record` when a candidate is
-valid and faster.
+Compact graphs, lower bounds, local scores, visual inspection, and plausible
+itineraries are allowed as diagnostics. They are not evidence of success until
+the full validator reports a valid 472-station route.
 
 ## Problem Rules
 
-* Visit identity is official MTA `Station ID`; all **472** canonical stations
-  must be covered.
-* Legal moves are train, wait, transfer, and run transitions accepted by
-  `solver.py`.
-* Score is total elapsed seconds: sum transition weights, not raw timestamp
-  differences.
-* The timetable is cyclic over a week. Any custom elapsed calculation must
-  handle week wrap correctly.
-* Start station, end station, and start time are free unless an experiment
-  explicitly fixes them.
+* Coverage is by official MTA `Station ID`; all **472** canonical stations must
+  be visited.
+* Legal transitions are exactly the moves accepted by `solver.py`: `train`,
+  `wait`, `transfer`, and `run`.
+* Cost is total elapsed seconds, computed from transition weights.
+* The timetable is cyclic over a week; never score by subtracting raw timestamps
+  without handling wraparound.
+* Start station, end station, service day, and start time are free unless an
+  experiment explicitly fixes them.
+* Use the actual GTFS-derived schedules in this repo. Simplified or synthetic
+  models can guide search, but final candidates must realize on the full graph.
 
-## Search Principles
+## Search Priorities
 
-The current best is already far from a naive route. To beat `22:14:10`, expect a
-structural route change, not just a small cleanup.
+The current repository best is around **24:24:30**, while the target is under
+**22:14:10**.
+That gap is too large for cosmetic polishing. Prefer structural search moves
+that can change the route shape.
 
-Pursue ideas that can plausibly save hours:
+Promising directions:
 
-* Start-time and day-type sweeps.
-* Alternative starts/finishes, especially human-plausible terminal choices.
-* Branch-order search instead of only first-visit station-order tweaks.
-* Explicit handling of remote branch clusters so they are not left for a late
-  repair tail.
-* Run-aware but not run-addicted routing; excessive running can mask bad macro
-  order.
-* Schedule-aware construction and validation on the real GTFS graph.
+* Simplify the network to true decision points while preserving recoverable
+  platform-level paths through pass-through stations.
+* Compare services, lines, branches, time windows, and day types for dominance
+  before pruning them.
+* Penalize or temporarily forbid long waits, excessive transfers, and excessive
+  out-of-system running during construction, then validate final routes under
+  the unmodified elapsed-time objective.
+* Search over start station, finish station, start time, weekday/weekend phase,
+  branch order, and trunk traversal order.
+* Build compact or macro models for idea generation, then realize candidates on
+  the full time-expanded graph.
+* Track lower bounds, bottlenecks, and failed assumptions so discarded
+  directions still teach something.
 
-Avoid spending too much time on ideas that can only save seconds:
-
-* Pure formatting/refactoring.
-* Local route polishing without evidence it changes the macro route.
-* Dropping lines/days globally without proving dominance in the schedule
-  context.
+Avoid spending a whole session only on small local edits around the incumbent
+unless the experiment is designed to test a clear hypothesis.
 
 ## Working Loop
 
-For each solving turn:
+For each solving session:
 
-1. Inspect current state rather than relying on memory.
-2. Validate the current best.
-3. Make a concrete solver/search improvement or produce a candidate.
-4. Validate candidates with `--record`.
-5. Report the best `RESULT` line and the lesson learned.
+1. Inspect the repo state.
+2. Validate the current best and record its `RESULT`.
+3. Choose one concrete modeling, pruning, construction, or improvement-search
+   hypothesis.
+4. Implement the smallest useful change or run the smallest decisive experiment.
+5. Write candidate routes under `solutions/`.
+6. Validate candidates with `--record`.
+7. Report the best `RESULT` line and the lesson learned.
 
 Useful commands:
 
@@ -110,9 +140,10 @@ venv/bin/python -m subway_challenge.search lns --seed-from solutions/best.json -
 venv/bin/python -m subway_challenge.solver validate solutions/candidate.json --record
 ```
 
-## Completion Target
+## Completion
 
-The goal remains open until the repo contains a route proven by `solver.py` with:
+Keep going until the repository contains a candidate proven by the full validator
+to satisfy:
 
 ```text
 valid=true
@@ -121,4 +152,5 @@ elapsed_s < 80050
 elapsed < 22:14:10
 ```
 
-Anything else is progress, not completion.
+Anything else is a baseline improvement, an experiment, or a useful clue. It is
+not the finish line.
