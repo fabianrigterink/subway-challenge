@@ -8,14 +8,20 @@ order and **recreates** it with regret-2 insertion, accepting via simulated
 annealing. The recreate is guided by a static station-to-station metric that is
 made *run-aware* (terminal runs folded in). Iterate with ``--seed-from``.
 
-This is the method that produced ``solutions/best.json`` (24:45:00). Run:
+This is the method that produced ``solutions/best.json`` (24:24:30). Run:
 
     python -m subway_challenge.search lns --seed-from solutions/best.json --terminal-runs
+
+For broader exploration before exploitation, ``start-grid`` sweeps start
+platforms, service days, and times of day, then writes checkpointed results
+under ``reports/``.
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
+import csv
 import heapq
 import json
 import math
@@ -25,10 +31,30 @@ import sys
 import time
 from pathlib import Path
 
+from .build_graph import WEEK
 from .solver import GRAPH_PKL, hms
 from .stations import StationIndex
 
 INF = float("inf")
+DAY_NAMES = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tues": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+    "sat": 5,
+    "saturday": 5,
+    "sun": 6,
+    "sunday": 6,
+}
 
 
 def _node_tables(G, si):
@@ -41,6 +67,89 @@ def _node_tables(G, si):
         t[nid] = int(d["t"])
         off[nid] = p2s.get(d["station"], d["station"])
     return off, stop, t
+
+
+def _elapsed(start_t, end_t):
+    """Elapsed seconds in the cyclic GTFS week."""
+    return int((int(end_t) - int(start_t)) % WEEK)
+
+
+def _parse_time_of_day(value):
+    """Parse HH:MM[:SS] or raw seconds since midnight."""
+    value = str(value).strip()
+    if ":" not in value:
+        return int(value)
+    parts = [int(x) for x in value.split(":")]
+    if len(parts) == 2:
+        h, m = parts
+        s = 0
+    elif len(parts) == 3:
+        h, m, s = parts
+    else:
+        raise ValueError(f"bad time-of-day: {value!r}")
+    return h * 3600 + m * 60 + s
+
+
+def _parse_days(value):
+    days = []
+    for raw in str(value).split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if "-" in item and all(x.strip().isdigit() for x in item.split("-", 1)):
+            a, b = [int(x.strip()) for x in item.split("-", 1)]
+            days.extend(range(a, b + 1))
+        elif item in DAY_NAMES:
+            days.append(DAY_NAMES[item])
+        else:
+            days.append(int(item))
+    bad = [d for d in days if d < 0 or d > 6]
+    if bad:
+        raise ValueError(f"days must be in 0..6, got {bad}")
+    return days
+
+
+def _parse_times(value):
+    return [_parse_time_of_day(x) for x in str(value).split(",") if x.strip()]
+
+
+def _stop_index(node_stop, node_t):
+    by_stop = collections.defaultdict(list)
+    for nid, stop in enumerate(node_stop):
+        if stop is not None:
+            by_stop[stop].append((node_t[nid], nid))
+    return {stop: (tuple(t for t, _ in rows), tuple(n for _, n in rows))
+            for stop, rows in ((s, sorted(v)) for s, v in by_stop.items())}
+
+
+def _first_event_at_or_after(stop_events, stop, target_t):
+    """First event for stop at/after target_t, wrapping within the cyclic week."""
+    times, nodes = stop_events.get(stop, ((), ()))
+    if not times:
+        return None
+    target_t %= WEEK
+    i = bisect.bisect_left(times, target_t)
+    if i == len(times):
+        i = 0
+    return nodes[i]
+
+
+def _load_seed_anchors(path_json, si):
+    spath = json.loads(Path(path_json).read_text())["path"]
+    seen, anchors = set(), []
+    for stop, _t in spath:
+        st = si.resolve(stop)
+        if st not in seen:
+            seen.add(st)
+            anchors.append(st)
+    return spath, anchors
+
+
+def _rotate_anchors(anchors, start_station):
+    if start_station not in anchors:
+        return list(anchors)
+    i = anchors.index(start_station)
+    return list(anchors[i:] + anchors[:i])
 
 
 def _terminal_stops(gtfs_dir="data/gtfs"):
@@ -129,7 +238,7 @@ def greedy_anchors(adj, tables, canonical, start_node):
             visited.add(node_off[nid])
         anchors.append(node_off[tgt])
         current = tgt
-    return path, anchors, node_t[current] - node_t[start_node]
+    return path, anchors, _elapsed(node_t[start_node], node_t[current])
 
 
 def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None):
@@ -222,12 +331,18 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
     start_t = node_t[snode]
     if anchors is None:
         _, anchors, _ = greedy_anchors(adj, tables, canonical, snode)
+    if not anchors:
+        return None, INF
     p = int(len(anchors) * split)
     prefix_anchors, tail = anchors[:p], anchors[p:]
     pre_suffix, pre_end, pre_visited = realize_from(adj, tables, snode, {node_off[snode]}, prefix_anchors, runs=runs)
+    if pre_suffix is None:
+        return None, INF
     prefix_path = [snode] + pre_suffix
     base_path, end, _ = realize_from(adj, tables, pre_end, pre_visited, tail, runs=runs)
-    cur_tail, cur_e = tail[:], node_t[end] - start_t
+    if base_path is None:
+        return None, INF
+    cur_tail, cur_e = tail[:], _elapsed(start_t, node_t[end])
     best_tail, best_e, best_path = tail[:], cur_e, base_path
     rng = random.Random(seed)
     t0 = time.time()
@@ -243,7 +358,7 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
         tp, tend, tvis = realize_from(adj, tables, pre_end, pre_visited, cand, runs=runs)
         if tp is None or len(tvis & canonical) < len(canonical):
             continue
-        e = node_t[tend] - start_t
+        e = _elapsed(start_t, node_t[tend])
         if e - cur_e < 0 or rng.random() < math.exp(-(e - cur_e) / T):
             cur_tail, cur_e = cand, e
             if e < best_e:
@@ -275,6 +390,200 @@ def _terminal_run_layer(G, si, node_off, radius_m):
     return runs, extra_edges
 
 
+def _start_stops(spec, node_off, node_stop, seed_stop=None):
+    """Resolve a start-grid spec into platform stop ids.
+
+    Supported presets are ``seed``, ``terminals``, and ``all``. Explicit tokens
+    may be platform stop ids (``A02S``) or official station ids, in which case
+    all platforms observed for that station are included.
+    """
+    all_stops = sorted({s for s in node_stop if s})
+    stops_by_station = collections.defaultdict(set)
+    for off, stop in zip(node_off, node_stop):
+        if off and stop:
+            stops_by_station[off].add(stop)
+
+    out = []
+    for raw in str(spec).split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key == "seed":
+            if seed_stop:
+                out.append(seed_stop)
+        elif key in {"terminal", "terminals"}:
+            terminal_set = _terminal_stops()
+            out.extend(s for s in all_stops if s in terminal_set)
+        elif key == "all":
+            out.extend(all_stops)
+        elif item in all_stops:
+            out.append(item)
+        elif item in stops_by_station:
+            out.extend(sorted(stops_by_station[item]))
+        else:
+            raise ValueError(f"unknown start stop/station: {item!r}")
+
+    seen, unique = set(), []
+    for stop in out:
+        if stop not in seen:
+            seen.add(stop)
+            unique.append(stop)
+    return unique
+
+
+def cmd_start_grid(args) -> int:
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    si = StationIndex.load()
+    tables = _node_tables(G, si)
+    node_off, node_stop, node_t = tables
+    stop_events = _stop_index(node_stop, node_t)
+
+    seed_stop = None
+    seed_anchors = None
+    if args.seed_from:
+        spath, seed_anchors = _load_seed_anchors(args.seed_from, si)
+        seed_stop = spath[0][0]
+        print(f"start-grid: seeded from {args.seed_from} ({len(seed_anchors)} anchors)")
+
+    starts = _start_stops(args.starts, node_off, node_stop, seed_stop)
+    if args.max_starts:
+        starts = starts[:args.max_starts]
+    days = _parse_days(args.days)
+    times = _parse_times(args.times)
+    splits = [float(x) for x in args.splits.split(",") if x.strip()]
+
+    runs, extra_edges = (None, [])
+    if args.terminal_runs:
+        runs, extra_edges = _terminal_run_layer(G, si, node_off, args.run_radius)
+    D, _ = static_station_metric(G, node_off, extra_edges)
+
+    if args.config_csv:
+        seen_configs = set()
+        base_configs = []
+        with Path(args.config_csv).open() as f:
+            source_rows = [r for r in csv.DictReader(f) if r.get("elapsed_s")]
+        source_rows.sort(key=lambda r: int(r["elapsed_s"]))
+        for row in source_rows:
+            key = (row["start_stop"], int(row["day"]), int(row["time_of_day_s"]))
+            if key in seen_configs:
+                continue
+            seen_configs.add(key)
+            base_configs.append(key)
+            if args.config_top_n and len(base_configs) >= args.config_top_n:
+                break
+    else:
+        base_configs = [(st, day, tod) for st in starts for day in days for tod in times]
+
+    all_configs = [(st, day, tod, sp, sd)
+                   for st, day, tod in base_configs
+                   for sp in splits
+                   for sd in range(args.seeds)]
+    indexed_configs = list(enumerate(all_configs, start=1))
+    if args.skip_configs:
+        indexed_configs = indexed_configs[args.skip_configs:]
+    if args.max_configs:
+        indexed_configs = indexed_configs[:args.max_configs]
+    per = args.per_config if args.per_config is not None else args.time_budget / max(1, len(indexed_configs))
+    if args.config_csv:
+        print(f"start-grid: {len(base_configs)} configs from {args.config_csv} "
+              f"x {len(splits)} splits x {args.seeds} seeds = {len(all_configs)} configs",
+              flush=True)
+    else:
+        print(f"start-grid: {len(starts)} starts x {len(days)} days x {len(times)} times "
+              f"x {len(splits)} splits x {args.seeds} seeds = {len(all_configs)} configs",
+              flush=True)
+    if args.skip_configs or args.max_configs:
+        print(f"start-grid: running {len(indexed_configs)} configs "
+              f"(skip={args.skip_configs}, max={args.max_configs})", flush=True)
+    print(f"start-grid: {per:.1f}s per config", flush=True)
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_csv = out_dir / "start_grid_results.csv"
+    csv_fields = [
+        "rank_seen", "start_stop", "start_station", "day", "time_of_day_s",
+        "target_t", "actual_t", "split", "seed", "elapsed_s", "elapsed", "steps"]
+    rows = []
+    kept = []
+    t0 = time.time()
+    interrupted = False
+    with report_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+        try:
+            for idx, (st, day, tod, sp, sd) in indexed_configs:
+                target_t = day * 86400 + tod
+                snode = _first_event_at_or_after(stop_events, st, target_t)
+                if snode is None:
+                    continue
+                start_station = node_off[snode]
+                anchors = None
+                if seed_anchors is not None:
+                    anchors = (_rotate_anchors(seed_anchors, start_station)
+                               if args.rotate_seed else list(seed_anchors))
+                full, elapsed = lns_run(
+                    G._adj, tables, si.canonical_stations, D, snode, sp, args.wmin,
+                    args.wmax, per, args.t0, args.tend, sd, args.jitter, anchors, runs)
+                row = {
+                    "rank_seen": idx,
+                    "start_stop": st,
+                    "start_station": start_station,
+                    "day": day,
+                    "time_of_day_s": tod,
+                    "target_t": target_t,
+                    "actual_t": node_t[snode],
+                    "split": sp,
+                    "seed": sd,
+                    "elapsed_s": None if elapsed == INF else int(elapsed),
+                    "elapsed": None if elapsed == INF else hms(elapsed),
+                    "steps": 0 if not full else len(full),
+                }
+                rows.append(row)
+                writer.writerow(row)
+                f.flush()
+                if full and elapsed < INF:
+                    kept.append((elapsed, row, full))
+                    kept.sort(key=lambda x: x[0])
+                    del kept[args.top_k:]
+                    if elapsed <= kept[0][0]:
+                        print(f"  {idx:4d}/{len(all_configs)} best {hms(elapsed)} "
+                              f"start={st}@day{day} {hms(tod)} split={sp} seed={sd}",
+                              flush=True)
+                elif idx % max(1, args.progress_every) == 0:
+                    print(f"  {idx:4d}/{len(all_configs)} no route for "
+                          f"start={st}@day{day} {hms(tod)}", flush=True)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("start-grid interrupted; writing partial results", flush=True)
+
+    report_json = out_dir / "start_grid_results.json"
+    report_json.write_text(json.dumps(rows, indent=2))
+
+    for rank, (elapsed, row, full) in enumerate(kept, start=1):
+        out = out_dir / f"{args.prefix}_top{rank:02d}_{int(elapsed)}.json"
+        meta = {
+            "radius_m": args.run_radius if args.terminal_runs else 5000,
+            "elapsed_s": int(elapsed),
+            "notes": ("start-grid "
+                      f"start={row['start_stop']} day={row['day']} "
+                      f"time={hms(row['time_of_day_s'])} split={row['split']} seed={row['seed']}"),
+        }
+        out.write_text(json.dumps({"meta": meta,
+                                   "path": [[node_stop[n], node_t[n]] for n in full]}))
+        print(f"  top {rank}: {hms(elapsed)} -> {out}", flush=True)
+
+    status = "interrupted" if interrupted else "done"
+    print(f"start-grid {status} in {time.time() - t0:.1f}s; wrote {report_json} and {report_csv}",
+          flush=True)
+    if kept:
+        print(f"start-grid best: {hms(kept[0][0])} {kept[0][1]}", flush=True)
+    else:
+        print("start-grid best: no valid realized routes", flush=True)
+    return 0
+
+
 def cmd_lns(args) -> int:
     with open(GRAPH_PKL, "rb") as f:
         G = pickle.load(f)
@@ -298,33 +607,43 @@ def cmd_lns(args) -> int:
             if st not in seen:
                 seen.add(st)
                 seed_anchors.append(st)
-        print(f"iterated LNS: seeded from {args.seed_from} ({len(seed_anchors)} anchors)")
+        print(f"iterated LNS: seeded from {args.seed_from} ({len(seed_anchors)} anchors)", flush=True)
     else:
         starts = args.start.split(",")
 
-    configs = [(st, sp, sd) for st in starts for sp in splits for sd in range(args.seeds)]
+    configs = [(st, sp, args.seed_offset + sd)
+               for st in starts for sp in splits for sd in range(args.seeds)]
     per = args.time_budget / len(configs)
-    print(f"LNS sweep: {len(configs)} configs x {per:.0f}s each")
+    print(f"LNS sweep: {len(configs)} configs x {per:.0f}s each "
+          f"(seed_offset={args.seed_offset})", flush=True)
 
     best = (INF, None, None)
-    for st, sp, sd in configs:
+    for i, (st, sp, sd) in enumerate(configs, start=1):
         cands = [n for n, d in G.nodes(data=True) if d["stop"] == st and d["t"] >= args.after]
         if not cands:
             continue
         snode = min(cands, key=lambda n: node_t[n])
+        t0_cfg = time.time()
         full, e = lns_run(G._adj, tables, si.canonical_stations, D, snode, sp, args.wmin,
                           args.wmax, per, args.t0, args.tend, sd, args.jitter, seed_anchors, runs)
+        status = hms(e) if full and e < INF else "failed"
+        print(f"  config {i:3d}/{len(configs)} elapsed={status} "
+              f"start={st} split={sp} seed={sd} wall={time.time() - t0_cfg:.1f}s",
+              flush=True)
         if full and e < best[0]:
             best = (e, full, (st, sp, sd))
-            print(f"  new best {hms(e)} from start={st} split={sp} seed={sd}")
+            print(f"  new best {hms(e)} from start={st} split={sp} seed={sd}", flush=True)
 
     e, full, key = best
-    print(f"LNS sweep best: {hms(e)} {key}")
+    print(f"LNS sweep best: {hms(e)} {key}", flush=True)
+    if full is None:
+        return 1
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"meta": {"radius_m": 5000, "notes": f"LNS {key}"},
+    out.write_text(json.dumps({"meta": {"radius_m": args.run_radius if args.terminal_runs else 5000,
+                                        "notes": f"LNS {key}"},
                                "path": [[node_stop[n], node_t[n]] for n in full]}))
-    print(f"wrote {len(full)} nodes -> {out}")
+    print(f"wrote {len(full)} nodes -> {out}", flush=True)
     return 0
 
 
@@ -336,6 +655,7 @@ def main(argv=None) -> int:
     ln.add_argument("--seed-from", default=None, help="Seed anchor order from a solution JSON (iterate).")
     ln.add_argument("--splits", default="0.1,0.15,0.2,0.3", help="Comma freeze fractions.")
     ln.add_argument("--seeds", type=int, default=4, help="SA seeds per (start, split).")
+    ln.add_argument("--seed-offset", type=int, default=0, help="First SA seed value to try.")
     ln.add_argument("--after", type=int, default=21600, help="Earliest start t (sec in week).")
     ln.add_argument("--terminal-runs", action="store_true", help="Enable dead-end terminal runs.")
     ln.add_argument("--run-radius", type=float, default=2500, help="Run layer radius (m).")
@@ -347,7 +667,50 @@ def main(argv=None) -> int:
     ln.add_argument("--tend", type=float, default=10, help="SA end temperature (sec).")
     ln.add_argument("--out", default="solutions/lns.json")
     ln.set_defaults(func=cmd_lns)
+
+    sg = sub.add_parser("start-grid", help="Grid-search start stops, service days, and times.")
+    sg.add_argument("--seed-from", default="solutions/best.json",
+                    help="Anchor order seed to rotate/reuse; use empty string to disable.")
+    sg.add_argument("--starts", default="terminals",
+                    help="Comma list of stop ids/station ids, or presets: seed, terminals, all.")
+    sg.add_argument("--max-starts", type=int, default=0,
+                    help="Optional cap after resolving --starts, useful for smoke runs.")
+    sg.add_argument("--days", default="0-4", help="Comma/range days, Mon=0 ... Sun=6.")
+    sg.add_argument("--times", default="05:00,06:00,07:00,08:00",
+                    help="Comma times of day as HH:MM[:SS] or seconds since midnight.")
+    sg.add_argument("--config-csv", default=None,
+                    help="Optional previous start-grid CSV; refines exact start/day/time rows.")
+    sg.add_argument("--config-top-n", type=int, default=0,
+                    help="With --config-csv, use only the N best unique start/day/time rows.")
+    sg.add_argument("--splits", default="0.0,0.1,0.2",
+                    help="Comma freeze fractions for the rotated/greedy anchor order.")
+    sg.add_argument("--seeds", type=int, default=1, help="SA seeds per grid point.")
+    sg.add_argument("--per-config", type=float, default=None,
+                    help="Seconds per config; defaults to --time-budget / configs.")
+    sg.add_argument("--time-budget", type=float, default=600,
+                    help="Total budget if --per-config is not set.")
+    sg.add_argument("--max-configs", type=int, default=0,
+                    help="Optional cap after building the grid, useful for smoke runs.")
+    sg.add_argument("--skip-configs", type=int, default=0,
+                    help="Skip this many grid configs before running; useful for resuming chunks.")
+    sg.add_argument("--terminal-runs", action="store_true", help="Enable dead-end terminal runs.")
+    sg.add_argument("--run-radius", type=float, default=2500, help="Run layer radius (m).")
+    sg.add_argument("--wmin", type=int, default=3)
+    sg.add_argument("--wmax", type=int, default=18)
+    sg.add_argument("--jitter", type=float, default=0.2)
+    sg.add_argument("--t0", type=float, default=600, help="SA start temperature (sec).")
+    sg.add_argument("--tend", type=float, default=10, help="SA end temperature (sec).")
+    sg.add_argument("--rotate-seed", dest="rotate_seed", action="store_true", default=True,
+                    help="Rotate seeded anchor order so the selected start station is first.")
+    sg.add_argument("--no-rotate-seed", dest="rotate_seed", action="store_false")
+    sg.add_argument("--top-k", type=int, default=5, help="Number of top route JSONs to write.")
+    sg.add_argument("--progress-every", type=int, default=25)
+    sg.add_argument("--out-dir", default="reports/start_grid")
+    sg.add_argument("--prefix", default="start_grid")
+    sg.set_defaults(func=cmd_start_grid)
     args = p.parse_args(argv)
+    if getattr(args, "seed_from", None) == "":
+        args.seed_from = None
     return args.func(args)
 
 
