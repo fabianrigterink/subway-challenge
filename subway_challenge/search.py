@@ -134,14 +134,36 @@ def _first_event_at_or_after(stop_events, stop, target_t):
     return nodes[i]
 
 
-def _load_seed_anchors(path_json, si):
-    spath = json.loads(Path(path_json).read_text())["path"]
+def _seed_anchors_from_path(spath, si, mode="first"):
+    """Extract station anchors from a route path.
+
+    ``first`` is the historical behavior: keep only first visits. ``all`` keeps
+    every station transition, including revisits. ``revisit`` keeps first visits
+    plus later revisits, which preserves branch/turn structure without anchoring
+    every intermediate stop.
+    """
+    if mode not in {"first", "all", "revisit"}:
+        raise ValueError(f"unknown anchor mode: {mode!r}")
     seen, anchors = set(), []
+    last = None
     for stop, _t in spath:
         st = si.resolve(stop)
-        if st not in seen:
+        if st == last:
+            continue
+        last = st
+        if mode == "all":
+            anchors.append(st)
+        elif st not in seen:
             seen.add(st)
             anchors.append(st)
+        elif mode == "revisit":
+            anchors.append(st)
+    return anchors
+
+
+def _load_seed_anchors(path_json, si, mode="first"):
+    spath = json.loads(Path(path_json).read_text())["path"]
+    anchors = _seed_anchors_from_path(spath, si, mode)
     return spath, anchors
 
 
@@ -241,7 +263,8 @@ def greedy_anchors(adj, tables, canonical, start_node):
     return path, anchors, _elapsed(node_t[start_node], node_t[current])
 
 
-def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None):
+def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None,
+                 skip_visited=True):
     """Realize an anchor order on the schedule from node ``current`` (with
     ``visited0`` already covered). Anchors covered incidentally are skipped.
     Returns (suffix_path_nodes, end_node, visited) or (None, None, None)."""
@@ -249,7 +272,7 @@ def realize_from(adj, tables, current, visited0, anchors, cap=300000, runs=None)
     visited = set(visited0)
     suffix = []
     for a in anchors:
-        if a in visited:
+        if skip_visited and a in visited:
             continue
         tgt, prev = _dijkstra_to_station(adj, node_off, current, a, cap, runs)
         if tgt is None:
@@ -324,7 +347,7 @@ def regret_insert(order, removed, D, rng=None, jitter=0.0):
 # -- LNS ----------------------------------------------------------------------
 
 def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp,
-            tend_temp, seed, jitter, anchors, runs):
+            tend_temp, seed, jitter, anchors, runs, skip_visited=True):
     """One LNS run: freeze a prefix of the order, then ruin+regret-recreate+SA on
     the tail. Seeds from ``anchors`` if given, else greedy. Returns (path, elapsed)."""
     node_off, _stop, node_t = tables
@@ -335,11 +358,14 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
         return None, INF
     p = int(len(anchors) * split)
     prefix_anchors, tail = anchors[:p], anchors[p:]
-    pre_suffix, pre_end, pre_visited = realize_from(adj, tables, snode, {node_off[snode]}, prefix_anchors, runs=runs)
+    pre_suffix, pre_end, pre_visited = realize_from(
+        adj, tables, snode, {node_off[snode]}, prefix_anchors,
+        runs=runs, skip_visited=skip_visited)
     if pre_suffix is None:
         return None, INF
     prefix_path = [snode] + pre_suffix
-    base_path, end, _ = realize_from(adj, tables, pre_end, pre_visited, tail, runs=runs)
+    base_path, end, _ = realize_from(
+        adj, tables, pre_end, pre_visited, tail, runs=runs, skip_visited=skip_visited)
     if base_path is None:
         return None, INF
     cur_tail, cur_e = tail[:], _elapsed(start_t, node_t[end])
@@ -355,7 +381,8 @@ def lns_run(adj, tables, canonical, D, snode, split, wmin, wmax, budget, t0_temp
         if not removed or not kept:
             continue
         cand = regret_insert(kept, removed, D, rng, jitter)
-        tp, tend, tvis = realize_from(adj, tables, pre_end, pre_visited, cand, runs=runs)
+        tp, tend, tvis = realize_from(
+            adj, tables, pre_end, pre_visited, cand, runs=runs, skip_visited=skip_visited)
         if tp is None or len(tvis & canonical) < len(canonical):
             continue
         e = _elapsed(start_t, node_t[tend])
@@ -388,6 +415,33 @@ def _terminal_run_layer(G, si, node_off, radius_m):
                    for a in cid2off.get(cid, ()) for b in cid2off.get(ocid, ())]
     print(f"terminal runs: {len(terminals)} termini -> {len(runs.adjacency)} run-source complexes")
     return runs, extra_edges
+
+
+def _run_metric_edges(runs, si):
+    from .walk_transfers import load_complexes
+
+    cid2off = {cid: {si.resolve(p) for p in c.parents}
+               for cid, c in load_complexes().items()}
+    return [(a, b, secs)
+            for cid, nb in runs.adjacency.items() for ocid, secs, _m in nb
+            for a in cid2off.get(cid, ()) for b in cid2off.get(ocid, ())]
+
+
+def _run_layer_and_metric_edges(G, si, node_off, mode, radius_m):
+    if mode == "none":
+        return None, []
+    if mode == "terminal":
+        return _terminal_run_layer(G, si, node_off, radius_m)
+    if mode == "all":
+        from .run_layer import RunLayer
+        runs = RunLayer.from_graph(G, radius_m=radius_m)
+        print(f"all runs: {len(runs.adjacency)} run-source complexes")
+        return runs, _run_metric_edges(runs, si)
+    raise ValueError(f"unknown run mode: {mode!r}")
+
+
+def _effective_run_mode(args):
+    return "terminal" if getattr(args, "terminal_runs", False) else args.run_mode
 
 
 def _start_stops(spec, node_off, node_stop, seed_stop=None):
@@ -443,9 +497,10 @@ def cmd_start_grid(args) -> int:
     seed_stop = None
     seed_anchors = None
     if args.seed_from:
-        spath, seed_anchors = _load_seed_anchors(args.seed_from, si)
+        spath, seed_anchors = _load_seed_anchors(args.seed_from, si, args.anchor_mode)
         seed_stop = spath[0][0]
-        print(f"start-grid: seeded from {args.seed_from} ({len(seed_anchors)} anchors)")
+        print(f"start-grid: seeded from {args.seed_from} "
+              f"({len(seed_anchors)} {args.anchor_mode} anchors)")
 
     starts = _start_stops(args.starts, node_off, node_stop, seed_stop)
     if args.max_starts:
@@ -454,9 +509,8 @@ def cmd_start_grid(args) -> int:
     times = _parse_times(args.times)
     splits = [float(x) for x in args.splits.split(",") if x.strip()]
 
-    runs, extra_edges = (None, [])
-    if args.terminal_runs:
-        runs, extra_edges = _terminal_run_layer(G, si, node_off, args.run_radius)
+    run_mode = _effective_run_mode(args)
+    runs, extra_edges = _run_layer_and_metric_edges(G, si, node_off, run_mode, args.run_radius)
     D, _ = static_station_metric(G, node_off, extra_edges)
 
     if args.config_csv:
@@ -525,7 +579,8 @@ def cmd_start_grid(args) -> int:
                                if args.rotate_seed else list(seed_anchors))
                 full, elapsed = lns_run(
                     G._adj, tables, si.canonical_stations, D, snode, sp, args.wmin,
-                    args.wmax, per, args.t0, args.tend, sd, args.jitter, anchors, runs)
+                    args.wmax, per, args.t0, args.tend, sd, args.jitter, anchors, runs,
+                    skip_visited=args.skip_visited_anchors)
                 row = {
                     "rank_seen": idx,
                     "start_stop": st,
@@ -564,7 +619,8 @@ def cmd_start_grid(args) -> int:
     for rank, (elapsed, row, full) in enumerate(kept, start=1):
         out = out_dir / f"{args.prefix}_top{rank:02d}_{int(elapsed)}.json"
         meta = {
-            "radius_m": args.run_radius if args.terminal_runs else 5000,
+            "radius_m": args.run_radius if run_mode != "none" else 5000,
+            "run_mode": run_mode,
             "elapsed_s": int(elapsed),
             "notes": ("start-grid "
                       f"start={row['start_stop']} day={row['day']} "
@@ -591,9 +647,8 @@ def cmd_lns(args) -> int:
     tables = _node_tables(G, si)
     node_off, node_stop, node_t = tables
 
-    runs, extra_edges = (None, [])
-    if args.terminal_runs:
-        runs, extra_edges = _terminal_run_layer(G, si, node_off, args.run_radius)
+    run_mode = _effective_run_mode(args)
+    runs, extra_edges = _run_layer_and_metric_edges(G, si, node_off, run_mode, args.run_radius)
     D, _ = static_station_metric(G, node_off, extra_edges)
 
     splits = [float(x) for x in args.splits.split(",")]
@@ -601,13 +656,9 @@ def cmd_lns(args) -> int:
     if args.seed_from:                                # iterated LNS: seed from a solution
         spath = json.loads(Path(args.seed_from).read_text())["path"]
         starts = [spath[0][0]]
-        seen, seed_anchors = set(), []
-        for stop, _t in spath:
-            st = si.resolve(stop)
-            if st not in seen:
-                seen.add(st)
-                seed_anchors.append(st)
-        print(f"iterated LNS: seeded from {args.seed_from} ({len(seed_anchors)} anchors)", flush=True)
+        seed_anchors = _seed_anchors_from_path(spath, si, args.anchor_mode)
+        print(f"iterated LNS: seeded from {args.seed_from} "
+              f"({len(seed_anchors)} {args.anchor_mode} anchors)", flush=True)
     else:
         starts = args.start.split(",")
 
@@ -625,7 +676,9 @@ def cmd_lns(args) -> int:
         snode = min(cands, key=lambda n: node_t[n])
         t0_cfg = time.time()
         full, e = lns_run(G._adj, tables, si.canonical_stations, D, snode, sp, args.wmin,
-                          args.wmax, per, args.t0, args.tend, sd, args.jitter, seed_anchors, runs)
+                          args.wmax, per, args.t0, args.tend, sd, args.jitter,
+                          seed_anchors, runs,
+                          skip_visited=args.skip_visited_anchors)
         status = hms(e) if full and e < INF else "failed"
         print(f"  config {i:3d}/{len(configs)} elapsed={status} "
               f"start={st} split={sp} seed={sd} wall={time.time() - t0_cfg:.1f}s",
@@ -640,7 +693,9 @@ def cmd_lns(args) -> int:
         return 1
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"meta": {"radius_m": args.run_radius if args.terminal_runs else 5000,
+    out.write_text(json.dumps({"meta": {"radius_m": args.run_radius if run_mode != "none" else 5000,
+                                        "run_mode": run_mode,
+                                        "elapsed_s": int(e),
                                         "notes": f"LNS {key}"},
                                "path": [[node_stop[n], node_t[n]] for n in full]}))
     print(f"wrote {len(full)} nodes -> {out}", flush=True)
@@ -648,16 +703,27 @@ def cmd_lns(args) -> int:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Subway Challenge optimizer (LNS + terminal runs).")
+    p = argparse.ArgumentParser(description="Subway Challenge optimizer (time-dependent LNS).")
     sub = p.add_subparsers(dest="cmd", required=True)
     ln = sub.add_parser("lns", help="Time-dependent LNS: ruin + regret recreate + SA.")
     ln.add_argument("--start", default="A02S", help="Comma start stops (greedy seed).")
     ln.add_argument("--seed-from", default=None, help="Seed anchor order from a solution JSON (iterate).")
+    ln.add_argument("--anchor-mode", choices=("first", "all", "revisit"), default="first",
+                    help="How to extract anchors from --seed-from.")
+    ln.add_argument("--skip-visited-anchors", dest="skip_visited_anchors",
+                    action="store_true", default=True,
+                    help="Skip target anchors already covered incidentally.")
+    ln.add_argument("--no-skip-visited-anchors", dest="skip_visited_anchors",
+                    action="store_false",
+                    help="Force realization to obey repeated/revisited anchors.")
     ln.add_argument("--splits", default="0.1,0.15,0.2,0.3", help="Comma freeze fractions.")
     ln.add_argument("--seeds", type=int, default=4, help="SA seeds per (start, split).")
     ln.add_argument("--seed-offset", type=int, default=0, help="First SA seed value to try.")
     ln.add_argument("--after", type=int, default=21600, help="Earliest start t (sec in week).")
-    ln.add_argument("--terminal-runs", action="store_true", help="Enable dead-end terminal runs.")
+    ln.add_argument("--run-mode", choices=("none", "terminal", "all"), default="none",
+                    help="Run-transfer policy used in realization and static metric.")
+    ln.add_argument("--terminal-runs", action="store_true",
+                    help="Alias for --run-mode terminal.")
     ln.add_argument("--run-radius", type=float, default=2500, help="Run layer radius (m).")
     ln.add_argument("--wmin", type=int, default=3)
     ln.add_argument("--wmax", type=int, default=22)
@@ -671,6 +737,14 @@ def main(argv=None) -> int:
     sg = sub.add_parser("start-grid", help="Grid-search start stops, service days, and times.")
     sg.add_argument("--seed-from", default="solutions/best.json",
                     help="Anchor order seed to rotate/reuse; use empty string to disable.")
+    sg.add_argument("--anchor-mode", choices=("first", "all", "revisit"), default="first",
+                    help="How to extract anchors from --seed-from.")
+    sg.add_argument("--skip-visited-anchors", dest="skip_visited_anchors",
+                    action="store_true", default=True,
+                    help="Skip target anchors already covered incidentally.")
+    sg.add_argument("--no-skip-visited-anchors", dest="skip_visited_anchors",
+                    action="store_false",
+                    help="Force realization to obey repeated/revisited anchors.")
     sg.add_argument("--starts", default="terminals",
                     help="Comma list of stop ids/station ids, or presets: seed, terminals, all.")
     sg.add_argument("--max-starts", type=int, default=0,
@@ -693,7 +767,10 @@ def main(argv=None) -> int:
                     help="Optional cap after building the grid, useful for smoke runs.")
     sg.add_argument("--skip-configs", type=int, default=0,
                     help="Skip this many grid configs before running; useful for resuming chunks.")
-    sg.add_argument("--terminal-runs", action="store_true", help="Enable dead-end terminal runs.")
+    sg.add_argument("--run-mode", choices=("none", "terminal", "all"), default="none",
+                    help="Run-transfer policy used in realization and static metric.")
+    sg.add_argument("--terminal-runs", action="store_true",
+                    help="Alias for --run-mode terminal.")
     sg.add_argument("--run-radius", type=float, default=2500, help="Run layer radius (m).")
     sg.add_argument("--wmin", type=int, default=3)
     sg.add_argument("--wmax", type=int, default=18)

@@ -41,22 +41,64 @@ plus a run-aware recreate metric.
 
 ### Solver / search
 
-The optimizer is **time-dependent LNS** (ruin a window of the visit order →
-regret-2 recreate → simulated-annealing accept), with out-of-system **runs**
-between dead-end terminals and a run-aware recreate metric. Iterate by seeding
-from the current best.
+The production route search is **time-dependent LNS** (ruin a window of the
+visit order → regret-2 recreate → simulated-annealing accept), with
+out-of-system **runs** between dead-end terminals and a run-aware recreate
+metric. Iterate by seeding from the current best.
 
 ```bash
 python -m subway_challenge.solver best                          # score the best route
 python -m subway_challenge.search lns --seed-from solutions/best.json \
     --terminal-runs --run-radius 2500 --seeds 6                 # iterated LNS (the optimizer)
+python -m subway_challenge.search start-grid --seed-from solutions/best.json \
+    --terminal-runs --run-radius 2500                           # start/time/grid portfolio
 python -m subway_challenge.solver validate <file> --record      # score/record any candidate
 ```
 
-`search.py` exposes the single `lns` command; the greedy construction it seeds
-from is built in automatically. (Many other heuristics — multi-start, GRASP,
-TSP-order, postman/Euler, etc. — were tried during development and discarded;
-LNS + terminal-runs is what produced `best.json`.)
+`search.py` exposes `lns` and `start-grid`. Both can use the default first-visit
+anchor abstraction or stricter repeated-anchor modes (`--anchor-mode all` /
+`--anchor-mode revisit`), and both support `--run-mode none|terminal|all`
+(`--terminal-runs` is the high-value shorthand for terminal-only runs). Many
+other heuristics — multi-start, GRASP, TSP-order, postman/Euler, etc. — were
+tried during development and discarded; LNS + terminal-runs is what produced
+`best.json`.
+
+### Optimization experiments
+
+The repo also contains solver-backed experimental tooling for attacking the
+current `24:24:30` plateau. These tools are diagnostics and column-generation
+infrastructure; every promoted route still has to pass `solver.py`.
+
+```bash
+python -m subway_challenge.optimize ortools-atsp --help
+python -m subway_challenge.columns --help
+python -m subway_challenge.repair --help
+python -m subway_challenge.neos_client --help
+```
+
+The main research direction is documented in
+[`OPTIMIZATION_STRATEGY.md`](OPTIMIZATION_STRATEGY.md) and
+[`CODEX.md`](CODEX.md). Current findings:
+
+| Route family | Status |
+|---|---|
+| Best full route | valid `472/472`, `24:24:30` |
+| Best near-record partial | exact replay `454/472`, `22:16:30` |
+| Current target gap | cover the remaining 18 stations without destroying late-middle coverage |
+
+The strongest current partial route misses:
+
+```text
+108, 18, 193, 194, 195, 200, 201, 202, 203,
+206, 207, 208, 209, 436, 437, 446, 7, 8
+```
+
+That evidence points away from single detours or one huge late suffix. The next
+useful optimization model is a protected multi-corridor column-generation /
+branch-and-price neighborhood: seed from the `454/472` exact partial route,
+protect several existing coverage corridors, price replacement columns with
+exact connector costs and time buckets, then reconstruct and validate any full
+candidate.
 
 ### Route summary notebook
 
