@@ -40,6 +40,13 @@ INF = float("inf")
 DEFAULT_EXACT_ARC_CACHE = Path("reports/optimization_runs/exact_connector_cache.jsonl")
 
 
+class _NoRunLayer:
+    platform_index = {}
+
+    def run_successors(self, _node):
+        return ()
+
+
 def _load_route(path: Path):
     data = json.loads(path.read_text())
     route = data.get("path", data)
@@ -379,6 +386,27 @@ def _row_endpoint_nodes(stop_events, node_t, row):
     return start, end
 
 
+def _row_endpoint_nodes_from_tables(node_stop, node_t, row):
+    """Resolve one row's endpoints without building a full stop-event index."""
+    start_stop = row["start"]["stop"]
+    start_t = int(row["start"]["time"])
+    end_stop = row["end"]["stop"]
+    end_t = int(row["end"]["time"])
+    start = end = None
+    for nid, stop in enumerate(node_stop):
+        if stop == start_stop and int(node_t[nid]) == start_t:
+            start = nid
+        if stop == end_stop and int(node_t[nid]) == end_t:
+            end = nid
+        if start is not None and end is not None:
+            break
+    if start is None:
+        raise ValueError(f"missing start event for {row.get('column_id')}")
+    if end is None:
+        raise ValueError(f"missing end event for {row.get('column_id')}")
+    return start, end
+
+
 def _row_path_nodes(stop_events, node_t, row):
     nodes = []
     for stop, t, *_rest in row["path"]:
@@ -513,6 +541,32 @@ def _load_column_rows(path: Path):
     return [json.loads(line) for line in lines]
 
 
+def _exclude_column_rows(rows, column_ids=None, column_prefixes=None):
+    excluded_ids = {
+        column_id.strip()
+        for column_id in str(column_ids or "").split(",")
+        if column_id.strip()
+    }
+    excluded_prefixes = [
+        prefix.strip()
+        for prefix in str(column_prefixes or "").split(",")
+        if prefix.strip()
+    ]
+    if not excluded_ids and not excluded_prefixes:
+        return rows, []
+    kept = []
+    excluded = []
+    for row in rows:
+        column_id = str(row.get("column_id", ""))
+        if column_id in excluded_ids or any(
+            column_id.startswith(prefix) for prefix in excluded_prefixes
+        ):
+            excluded.append(column_id)
+        else:
+            kept.append(row)
+    return kept, excluded
+
+
 def _phase_proxy_gap(source_end_t, target_start_t, static_cost):
     gap = (int(target_start_t) - int(source_end_t)) % WEEK
     if gap >= static_cost:
@@ -568,49 +622,59 @@ def _exact_arc_cache_key(node_stop, node_t, src, dst, run_mode, run_radius, cap,
     )
 
 
+def _candidate_exact_arc_proxy(rows, D, i, j,
+                               min_same_station_gap_s=0,
+                               min_opposite_direction_gap_s=0):
+    if i == j:
+        return None
+    row_i = rows[i]
+    row_j = rows[j]
+    a = row_i["end"]["station"]
+    end_t = int(row_i["end"]["time"])
+    end_stop = row_i["end"]["stop"]
+    b = row_j["start"]["station"]
+    static = 0 if a == b else int(D.get(a, {}).get(b, BIG_COST))
+    if static >= BIG_COST:
+        return None
+    raw_gap = (int(row_j["start"]["time"]) - end_t) % WEEK
+    start_stop = row_j["start"]["stop"]
+    if a == b and end_stop != start_stop and raw_gap < min_same_station_gap_s:
+        return None
+    if (_direction(end_stop) and _direction(start_stop)
+            and _direction(end_stop) != _direction(start_stop)
+            and raw_gap < min_opposite_direction_gap_s):
+        return None
+    return _phase_proxy_gap(end_t, row_j["start"]["time"], static)
+
+
 def _candidate_exact_arcs(rows, D, top_k, max_proxy_s,
                           min_same_station_gap_s=0,
                           min_opposite_direction_gap_s=0):
     arcs = []
-    for i, row_i in enumerate(rows):
-        a = row_i["end"]["station"]
-        end_t = int(row_i["end"]["time"])
-        end_stop = row_i["end"]["stop"]
+    for i, _row_i in enumerate(rows):
         candidates = []
-        for j, row_j in enumerate(rows):
-            if i == j:
+        for j, _row_j in enumerate(rows):
+            proxy = _candidate_exact_arc_proxy(
+                rows,
+                D,
+                i,
+                j,
+                min_same_station_gap_s=min_same_station_gap_s,
+                min_opposite_direction_gap_s=min_opposite_direction_gap_s,
+            )
+            if proxy is None or proxy > max_proxy_s:
                 continue
-            b = row_j["start"]["station"]
-            static = 0 if a == b else int(D.get(a, {}).get(b, BIG_COST))
-            if static >= BIG_COST:
-                continue
-            raw_gap = (int(row_j["start"]["time"]) - end_t) % WEEK
-            start_stop = row_j["start"]["stop"]
-            if a == b and end_stop != start_stop and raw_gap < min_same_station_gap_s:
-                continue
-            if (_direction(end_stop) and _direction(start_stop)
-                    and _direction(end_stop) != _direction(start_stop)
-                    and raw_gap < min_opposite_direction_gap_s):
-                continue
-            proxy = _phase_proxy_gap(end_t, row_j["start"]["time"], static)
-            if proxy <= max_proxy_s:
-                candidates.append((proxy, i, j))
+            candidates.append((proxy, i, j))
         candidates.sort()
         arcs.extend(candidates[:top_k])
     return arcs
 
 
-def _exact_connector_arcs(G, tables, rows, runs, D, top_k, max_proxy_s,
-                          max_connector_s, cap, run_mode, run_radius,
-                          cache_path=None,
-                          min_same_station_gap_s=0,
-                          min_opposite_direction_gap_s=0):
+def _price_exact_arc_candidates(G, tables, rows, runs, candidates,
+                                max_connector_s, cap, run_mode, run_radius,
+                                cache_path=None, progress_label="exact connectors"):
     node_off, node_stop, node_t = tables
     stop_events = _stop_index(node_stop, node_t)
-    candidates = _candidate_exact_arcs(
-        rows, D, top_k, max_proxy_s,
-        min_same_station_gap_s=min_same_station_gap_s,
-        min_opposite_direction_gap_s=min_opposite_direction_gap_s)
     arcs = []
     cache = _load_exact_arc_cache(cache_path)
     cache_hits = 0
@@ -648,14 +712,98 @@ def _exact_connector_arcs(G, tables, rows, runs, D, top_k, max_proxy_s,
         if cost <= max_connector_s:
             arcs.append((int(cost), i, j))
         if k % 500 == 0 or k == len(candidates):
-            print(f"exact connectors: {k}/{len(candidates)} candidates "
+            print(f"{progress_label}: {k}/{len(candidates)} candidates "
                   f"kept={len(arcs)}", flush=True)
     _append_exact_arc_cache(cache_path, cache_new)
     if cache_path:
-        print(f"exact connector cache: hits={cache_hits} misses={cache_misses} "
+        print(f"{progress_label} cache: hits={cache_hits} misses={cache_misses} "
               f"new={len(cache_new)} entries={len(cache)} path={cache_path}",
               flush=True)
     return arcs
+
+
+def _exact_connector_arcs(G, tables, rows, runs, D, top_k, max_proxy_s,
+                          max_connector_s, cap, run_mode, run_radius,
+                          cache_path=None,
+                          min_same_station_gap_s=0,
+                          min_opposite_direction_gap_s=0):
+    candidates = _candidate_exact_arcs(
+        rows, D, top_k, max_proxy_s,
+        min_same_station_gap_s=min_same_station_gap_s,
+        min_opposite_direction_gap_s=min_opposite_direction_gap_s)
+    return _price_exact_arc_candidates(
+        G,
+        tables,
+        rows,
+        runs,
+        candidates,
+        max_connector_s=max_connector_s,
+        cap=cap,
+        run_mode=run_mode,
+        run_radius=run_radius,
+        cache_path=cache_path,
+    )
+
+
+def _required_neighbor_exact_arcs(G, tables, rows, runs, D, required_row_indices,
+                                  top_k, max_proxy_s, max_connector_s, cap,
+                                  run_mode, run_radius, cache_path=None,
+                                  min_same_station_gap_s=0,
+                                  min_opposite_direction_gap_s=0):
+    required = sorted(set(required_row_indices or []))
+    if not required or top_k <= 0:
+        return []
+    by_pair = {}
+    for j in required:
+        incoming = []
+        for i in range(len(rows)):
+            proxy = _candidate_exact_arc_proxy(
+                rows,
+                D,
+                i,
+                j,
+                min_same_station_gap_s=min_same_station_gap_s,
+                min_opposite_direction_gap_s=min_opposite_direction_gap_s,
+            )
+            if proxy is None or proxy > max_proxy_s:
+                continue
+            incoming.append((proxy, i, j))
+        for proxy, i, j in sorted(incoming)[:top_k]:
+            by_pair[(i, j)] = (proxy, i, j)
+
+    for i in required:
+        outgoing = []
+        for j in range(len(rows)):
+            proxy = _candidate_exact_arc_proxy(
+                rows,
+                D,
+                i,
+                j,
+                min_same_station_gap_s=min_same_station_gap_s,
+                min_opposite_direction_gap_s=min_opposite_direction_gap_s,
+            )
+            if proxy is None or proxy > max_proxy_s:
+                continue
+            outgoing.append((proxy, i, j))
+        for proxy, i, j in sorted(outgoing)[:top_k]:
+            by_pair[(i, j)] = (proxy, i, j)
+
+    candidates = sorted(by_pair.values())
+    print(f"required-neighbor arc candidates: required={len(required)} "
+          f"top_k={top_k} candidates={len(candidates)}", flush=True)
+    return _price_exact_arc_candidates(
+        G,
+        tables,
+        rows,
+        runs,
+        candidates,
+        max_connector_s=max_connector_s,
+        cap=cap,
+        run_mode=run_mode,
+        run_radius=run_radius,
+        cache_path=cache_path,
+        progress_label="required exact connectors",
+    )
 
 
 def _merge_arcs_min_cost(arcs, extra_arcs):
@@ -676,13 +824,17 @@ def _forced_solution_arcs(G, tables, rows, runs, solution_files, cap, max_connec
     forced = []
     missing = 0
     infeasible = 0
+    missing_pairs = []
+    infeasible_pairs = []
     for solution_file in solution_files:
-        solution_rows = _load_column_rows(Path(solution_file))
-        for row_i, row_j in zip(solution_rows, solution_rows[1:]):
-            i = by_id.get(row_i.get("column_id"))
-            j = by_id.get(row_j.get("column_id"))
+        solution_ids = _selected_column_ids_from_solution(Path(solution_file))
+        for column_i, column_j in zip(solution_ids, solution_ids[1:]):
+            i = by_id.get(column_i)
+            j = by_id.get(column_j)
             if i is None or j is None:
                 missing += 1
+                if len(missing_pairs) < 8:
+                    missing_pairs.append((column_i, column_j))
                 continue
             _start_i, end_i = _row_endpoint_nodes(stop_events, node_t, rows[i])
             start_j, _end_j = _row_endpoint_nodes(stop_events, node_t, rows[j])
@@ -695,10 +847,16 @@ def _forced_solution_arcs(G, tables, rows, runs, solution_files, cap, max_connec
                 G._adj, end_i, start_j, cap, runs=runs, max_cost=max_cost)
             if tgt is None:
                 infeasible += 1
+                if len(infeasible_pairs) < 8:
+                    infeasible_pairs.append((column_i, column_j))
                 continue
             forced.append((gap, i, j))
     print(f"forced solution arcs: kept={len(forced)} missing={missing} "
           f"infeasible={infeasible}", flush=True)
+    if missing_pairs:
+        print(f"forced solution missing arcs e.g. {missing_pairs}", flush=True)
+    if infeasible_pairs:
+        print(f"forced solution infeasible arcs e.g. {infeasible_pairs}", flush=True)
     return forced
 
 
@@ -913,18 +1071,63 @@ def cmd_sequence(args) -> int:
 def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
                       require_pricing_kind=None, min_required_pricing=0,
                       required_row_indices=None,
+                      required_index_groups=None,
                       allowed_start_rows=None, allowed_end_rows=None,
                       uncovered_penalty_s=0,
-                      hint_order_indices=None):
+                      min_covered_count=None,
+                      max_total_elapsed_s=None,
+                      hint_order_indices=None,
+                      protected_stations=None,
+                      protected_station_groups=None,
+                      uncovered_penalty_groups=None,
+                      ordered_station_groups=None,
+                      strict_order_station_groups=False,
+                      first_hit_order_station_groups=False,
+                      stop_after_first_solution=False,
+                      forbidden_row_indices=None):
     canonical = set(StationIndex.load().canonical_stations)
+    protected_stations = set(protected_stations or []) & canonical
+    protected_station_groups = list(protected_station_groups or [])
+    uncovered_penalty_groups = list(uncovered_penalty_groups or [])
+    ordered_station_groups = list(ordered_station_groups or [])
+    extra_uncovered_penalty_by_station = defaultdict(int)
+    for group in uncovered_penalty_groups:
+        for station in group["stations"]:
+            if station in canonical:
+                extra_uncovered_penalty_by_station[station] += int(group["penalty_s"])
+    soft_coverage = bool(uncovered_penalty_s or extra_uncovered_penalty_by_station)
     by_station = {station: [] for station in canonical}
     for i, row in enumerate(rows):
         for station in row.get("covered_stations", []):
             if station in by_station:
                 by_station[station].append(i)
     missing = sorted(st for st, cols in by_station.items() if not cols)
-    if missing and not uncovered_penalty_s:
+    if missing and not soft_coverage:
         raise ValueError(f"column pool misses {len(missing)} station(s), e.g. {missing[:8]}")
+    missing_protected = sorted(st for st in protected_stations if not by_station.get(st))
+    if missing_protected:
+        raise ValueError(
+            f"column pool misses protected station(s), e.g. {missing_protected[:8]}")
+    for group in protected_station_groups:
+        min_hits = int(group["min_hits"])
+        if min_hits < 0 or min_hits > len(group["stations"]):
+            raise ValueError(
+                f"protected group {group['name']!r} has impossible min_hits "
+                f"{min_hits} for {len(group['stations'])} station(s)")
+    ordered_group_candidates = []
+    for group in ordered_station_groups:
+        min_hits = int(group["min_hits"])
+        stations = set(group["stations"])
+        candidates = [
+            i
+            for i, row in enumerate(rows)
+            if len(stations.intersection(row.get("covered_stations", []))) >= min_hits
+        ]
+        if not candidates:
+            raise ValueError(
+                f"ordered group {group['label']!r} has no row covering "
+                f"{min_hits}/{len(stations)} station(s)")
+        ordered_group_candidates.append(candidates)
 
     model = cp_model.CpModel()
     n = len(rows)
@@ -941,8 +1144,10 @@ def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
         incoming[j].append(y[i, j])
 
     cover_vars = {}
-    if uncovered_penalty_s:
-        for station, cols in by_station.items():
+    for station, cols in by_station.items():
+        if station in protected_stations:
+            model.Add(sum(x[i] for i in cols) >= 1).WithName(f"protect_{station}")
+        elif soft_coverage:
             covered = model.NewBoolVar(f"covered_{station}")
             cover_vars[station] = covered
             if cols:
@@ -950,9 +1155,33 @@ def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
                     f"covered_if_selected_{station}")
             else:
                 model.Add(covered == 0).WithName(f"uncoverable_{station}")
-    else:
-        for station, cols in by_station.items():
+        else:
             model.Add(sum(x[i] for i in cols) >= 1).WithName(f"cover_{station}")
+    if protected_station_groups:
+        if not soft_coverage:
+            print("protected station groups are redundant without relaxed coverage",
+                  flush=True)
+        for group_index, group in enumerate(protected_station_groups):
+            fixed_hits = 0
+            terms = []
+            for station in group["stations"]:
+                if station in protected_stations:
+                    fixed_hits += 1
+                elif soft_coverage:
+                    terms.append(cover_vars[station])
+            if soft_coverage:
+                model.Add(sum(terms) + fixed_hits >= int(group["min_hits"])).WithName(
+                    f"protect_group_{group_index}_{group['name']}")
+    if min_covered_count is not None:
+        min_covered_count = int(min_covered_count)
+        if min_covered_count < 0 or min_covered_count > len(canonical):
+            raise ValueError(
+                f"min covered count must be between 0 and {len(canonical)}, "
+                f"got {min_covered_count}")
+        if soft_coverage:
+            model.Add(
+                sum(cover_vars.values()) + len(protected_stations) >= min_covered_count
+            ).WithName("min_covered_count")
     if require_pricing_kind and min_required_pricing:
         required = [i for i, row in enumerate(rows) if require_pricing_kind in row]
         if len(required) < min_required_pricing:
@@ -964,6 +1193,38 @@ def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
             f"require_{require_pricing_kind}")
     for i in sorted(set(required_row_indices or [])):
         model.Add(x[i] == 1).WithName(f"require_column_{i}")
+    for i in sorted(set(forbidden_row_indices or [])):
+        model.Add(x[i] == 0).WithName(f"forbid_column_{i}")
+    for name, indices, min_count in required_index_groups or []:
+        model.Add(sum(x[i] for i in indices) >= int(min_count)).WithName(name)
+    ordered_group_vars = []
+    for group_index, (group, candidates) in enumerate(
+        zip(ordered_station_groups, ordered_group_candidates)
+    ):
+        witness = []
+        pos = model.NewIntVar(0, n, f"ordered_group_pos_{group_index}")
+        for i in candidates:
+            z = model.NewBoolVar(f"ordered_group_{group_index}_row_{i}")
+            model.Add(z <= x[i])
+            model.Add(pos == order[i]).OnlyEnforceIf(z)
+            if first_hit_order_station_groups:
+                model.Add(pos <= order[i]).OnlyEnforceIf(x[i])
+            witness.append((i, z))
+        model.Add(sum(z for _i, z in witness) == 1).WithName(
+            f"ordered_group_witness_{group_index}_{group['name']}")
+        ordered_group_vars.append({
+            "group": group,
+            "candidates": candidates,
+            "position": pos,
+            "witness": witness,
+        })
+    for left, right in zip(ordered_group_vars, ordered_group_vars[1:]):
+        if strict_order_station_groups:
+            model.Add(left["position"] + 1 <= right["position"]).WithName(
+                f"ordered_group_strict_before_{left['group']['name']}_{right['group']['name']}")
+        else:
+            model.Add(left["position"] <= right["position"]).WithName(
+                f"ordered_group_before_{left['group']['name']}_{right['group']['name']}")
     model.Add(sum(start) == 1)
     model.Add(sum(end) == 1)
     if allowed_start_rows is not None:
@@ -990,13 +1251,28 @@ def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
         model.Add(order[j] >= order[i] + 1 - n * (1 - y[i, j]))
 
     arc_cost = {(i, j): cost for cost, i, j in arcs}
-    objective = (
-        sum((int(row["elapsed_s"]) + column_penalty) * x[i] for i, row in enumerate(rows))
+    elapsed_terms = (
+        sum(int(row["elapsed_s"]) * x[i] for i, row in enumerate(rows))
         + sum(arc_cost[i, j] * var for (i, j), var in y.items())
     )
-    if uncovered_penalty_s:
+    max_possible_elapsed = (
+        sum(int(row["elapsed_s"]) for row in rows)
+        + sum(int(cost) for cost, _i, _j in arcs)
+    )
+    elapsed_var = model.NewIntVar(0, max_possible_elapsed, "total_elapsed")
+    model.Add(elapsed_var == elapsed_terms).WithName("bind_total_elapsed")
+    if max_total_elapsed_s is not None:
+        model.Add(elapsed_var <= int(max_total_elapsed_s)).WithName("max_total_elapsed")
+    objective = elapsed_var
+    if column_penalty:
+        objective += sum(int(column_penalty) * x[i] for i in range(n))
+    if soft_coverage:
         objective += sum(int(uncovered_penalty_s) * (1 - var)
                          for var in cover_vars.values())
+        objective += sum(
+            int(extra_uncovered_penalty_by_station.get(station, 0)) * (1 - var)
+            for station, var in cover_vars.items()
+        )
     model.Minimize(objective)
 
     hint_order_indices = list(hint_order_indices or [])
@@ -1015,6 +1291,7 @@ def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit_s
     solver.parameters.num_search_workers = workers
+    solver.parameters.stop_after_first_solution = bool(stop_after_first_solution)
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return solver, status, [], {}
@@ -1035,6 +1312,8 @@ def _solve_path_cover(rows, arcs, time_limit_s, workers, column_penalty,
         "y": y,
         "arc_cost": arc_cost,
         "covered": cover_vars,
+        "elapsed_var": elapsed_var,
+        "ordered_group_vars": ordered_group_vars,
     }
 
 
@@ -1128,6 +1407,11 @@ def _selected_column_ids_from_solution(path: Path) -> list[str]:
     data = json.loads(path.read_text())
     if isinstance(data.get("selected_order"), list):
         return [str(column_id) for column_id in data["selected_order"]]
+    meta = data.get("meta")
+    if isinstance(meta, dict) and isinstance(meta.get("selected_order"), list):
+        return [str(column_id) for column_id in meta["selected_order"]]
+    if isinstance(meta, dict) and isinstance(meta.get("exact_cover_columns"), list):
+        return [str(column_id) for column_id in meta["exact_cover_columns"]]
     if isinstance(data.get("selected_columns"), list):
         return [
             str(row["column_id"])
@@ -1137,12 +1421,240 @@ def _selected_column_ids_from_solution(path: Path) -> list[str]:
     raise ValueError(f"{path} has no selected_order or selected_columns")
 
 
+def _load_station_json(path: Path) -> list[str]:
+    data = json.loads(path.read_text())
+    if isinstance(data, list):
+        return [str(station) for station in data]
+    for key in ("stations", "protected_stations", "relaxed_uncovered_stations"):
+        if isinstance(data, dict) and key in data:
+            return [str(station) for station in data[key]]
+    raise ValueError(
+        f"{path} must be a JSON list or contain stations/protected_stations/"
+        "relaxed_uncovered_stations")
+
+
+def _load_exact_cover_station_set(args, si) -> list[str]:
+    stations = []
+    if args.protect_stations:
+        stations.extend(
+            station.strip()
+            for station in str(args.protect_stations).split(",")
+            if station.strip()
+        )
+    for path in args.protect_stations_file or []:
+        stations.extend(_load_station_json(Path(path)))
+    bad = [station for station in stations if station not in si.canonical_stations]
+    if bad:
+        raise SystemExit(f"--protect-stations contains non-canonical ids, e.g. {bad[:8]}")
+    seen = set()
+    return [station for station in stations if not (station in seen or seen.add(station))]
+
+
+def _load_exact_cover_station_groups(args, si) -> list[dict]:
+    groups = []
+    for raw_group in str(args.protect_station_groups or "").split(";"):
+        raw_group = raw_group.strip()
+        if not raw_group:
+            continue
+        try:
+            name, raw_min_hits, raw_stations = raw_group.split(":", 2)
+        except ValueError as exc:
+            raise SystemExit(
+                "--protect-station-groups entries must be NAME:MIN:station,station"
+            ) from exc
+        name = name.strip() or f"group{len(groups) + 1}"
+        safe_name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+        try:
+            min_hits = int(raw_min_hits)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--protect-station-groups has non-integer min hits for {name!r}"
+            ) from exc
+        stations = [
+            station.strip()
+            for station in raw_stations.split(",")
+            if station.strip()
+        ]
+        bad = [station for station in stations if station not in si.canonical_stations]
+        if bad:
+            raise SystemExit(
+                f"--protect-station-groups {name!r} has non-canonical ids, e.g. {bad[:8]}")
+        seen = set()
+        stations = [
+            station for station in stations
+            if not (station in seen or seen.add(station))
+        ]
+        if not stations:
+            raise SystemExit(f"--protect-station-groups {name!r} has no stations")
+        if min_hits < 0 or min_hits > len(stations):
+            raise SystemExit(
+                f"--protect-station-groups {name!r} min {min_hits} "
+                f"must be between 0 and {len(stations)}")
+        groups.append({
+            "name": safe_name,
+            "label": name,
+            "min_hits": min_hits,
+            "stations": stations,
+        })
+    return groups
+
+
+def _load_exact_cover_penalty_groups(args, si) -> list[dict]:
+    groups = []
+    for raw_group in str(args.uncovered_penalty_groups or "").split(";"):
+        raw_group = raw_group.strip()
+        if not raw_group:
+            continue
+        try:
+            name, raw_penalty, raw_stations = raw_group.split(":", 2)
+        except ValueError as exc:
+            raise SystemExit(
+                "--uncovered-penalty-groups entries must be "
+                "NAME:PENALTY_SECONDS:station,station"
+            ) from exc
+        name = name.strip() or f"group{len(groups) + 1}"
+        safe_name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+        try:
+            penalty_s = int(raw_penalty)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--uncovered-penalty-groups has non-integer penalty for {name!r}"
+            ) from exc
+        if penalty_s < 0:
+            raise SystemExit(
+                f"--uncovered-penalty-groups {name!r} penalty must be non-negative")
+        stations = [
+            station.strip()
+            for station in raw_stations.split(",")
+            if station.strip()
+        ]
+        bad = [station for station in stations if station not in si.canonical_stations]
+        if bad:
+            raise SystemExit(
+                f"--uncovered-penalty-groups {name!r} has non-canonical ids, "
+                f"e.g. {bad[:8]}")
+        seen = set()
+        stations = [
+            station for station in stations
+            if not (station in seen or seen.add(station))
+        ]
+        if not stations:
+            raise SystemExit(f"--uncovered-penalty-groups {name!r} has no stations")
+        groups.append({
+            "name": safe_name,
+            "label": name,
+            "penalty_s": penalty_s,
+            "stations": stations,
+        })
+    return groups
+
+
+def _load_ordered_station_groups(raw_value, si) -> list[dict]:
+    groups = []
+    for raw_group in str(raw_value or "").split(";"):
+        raw_group = raw_group.strip()
+        if not raw_group:
+            continue
+        try:
+            name, raw_min_hits, raw_stations = raw_group.split(":", 2)
+        except ValueError as exc:
+            raise SystemExit(
+                "--order-station-groups entries must be NAME:MIN:station,station"
+            ) from exc
+        name = name.strip() or f"ordered_group_{len(groups) + 1}"
+        safe_name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+        try:
+            min_hits = int(raw_min_hits)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--order-station-groups has non-integer min hits for {name!r}"
+            ) from exc
+        stations = [
+            station.strip()
+            for station in raw_stations.split(",")
+            if station.strip()
+        ]
+        bad = [station for station in stations if station not in si.canonical_stations]
+        if bad:
+            raise SystemExit(
+                f"--order-station-groups {name!r} has non-canonical ids, e.g. {bad[:8]}")
+        seen = set()
+        stations = [
+            station for station in stations
+            if not (station in seen or seen.add(station))
+        ]
+        if not stations:
+            raise SystemExit(f"--order-station-groups {name!r} has no stations")
+        if min_hits < 1 or min_hits > len(stations):
+            raise SystemExit(
+                f"--order-station-groups {name!r} min {min_hits} "
+                f"must be between 1 and {len(stations)}")
+        groups.append({
+            "name": safe_name,
+            "label": name,
+            "min_hits": min_hits,
+            "stations": stations,
+        })
+    return groups
+
+
+def _load_prefix_requirement_groups(raw_value):
+    groups = []
+    for raw_group in str(raw_value or "").split(";"):
+        raw_group = raw_group.strip()
+        if not raw_group:
+            continue
+        parts = raw_group.split(":", 2)
+        if len(parts) == 2:
+            label = f"prefix_group_{len(groups) + 1}"
+            raw_min, raw_prefixes = parts
+        elif len(parts) == 3:
+            label, raw_min, raw_prefixes = parts
+            label = label.strip() or f"prefix_group_{len(groups) + 1}"
+        else:
+            raise SystemExit(
+                "--require-column-id-prefix-group entries must be "
+                "[LABEL:]MIN:PREFIX|PREFIX")
+        try:
+            min_count = int(raw_min)
+        except ValueError as exc:
+            raise SystemExit(
+                f"--require-column-id-prefix-group {label!r} has "
+                f"non-integer min count {raw_min!r}") from exc
+        if min_count < 0:
+            raise SystemExit(
+                f"--require-column-id-prefix-group {label!r} min count "
+                "must be non-negative")
+        prefixes = [
+            prefix.strip()
+            for prefix in raw_prefixes.replace(",", "|").split("|")
+            if prefix.strip()
+        ]
+        if not prefixes:
+            raise SystemExit(
+                f"--require-column-id-prefix-group {label!r} has no prefixes")
+        groups.append({
+            "label": label,
+            "min_count": min_count,
+            "prefixes": prefixes,
+        })
+    return groups
+
+
 def cmd_exact_cover(args) -> int:
     import pickle
 
     rows = _load_column_rows(Path(args.columns_source))
     if args.max_columns:
         rows = rows[:args.max_columns]
+    rows, excluded_rows = _exclude_column_rows(
+        rows,
+        column_ids=args.exclude_column_id,
+        column_prefixes=args.exclude_column_id_prefix,
+    )
+    if excluded_rows:
+        print(f"excluded columns: {len(excluded_rows)} e.g. {excluded_rows[:8]}",
+              flush=True)
     if not rows:
         raise SystemExit("no columns to solve")
     missing_path = [row.get("column_id", str(i)) for i, row in enumerate(rows) if "path" not in row]
@@ -1208,8 +1720,61 @@ def cmd_exact_cover(args) -> int:
 
     start_window = _parse_week_time_window(args.start_time_window)
     end_window = _parse_week_time_window(args.end_time_window)
+    max_total_elapsed_s = _parse_duration_seconds(args.max_total_elapsed)
     allowed_start_rows = _rows_in_time_window(rows, "start", start_window)
     allowed_end_rows = _rows_in_time_window(rows, "end", end_window)
+    protected_stations = _load_exact_cover_station_set(args, si)
+    protected_station_groups = _load_exact_cover_station_groups(args, si)
+    uncovered_penalty_groups = _load_exact_cover_penalty_groups(args, si)
+    ordered_station_groups = _load_ordered_station_groups(
+        args.order_station_groups, si)
+    protected_row_start_stops = {
+        stop.strip()
+        for stop in str(args.protected_row_start_stop or "").split(",")
+        if stop.strip()
+    }
+    protected_row_prefixes = _column_id_prefixes(args.protected_row_column_id_prefix)
+    protected_filter_stations = set(protected_stations)
+    for group in protected_station_groups:
+        protected_filter_stations.update(group["stations"])
+    protected_row_allowed_indices = []
+    protected_row_forbidden_indices = []
+    protected_row_filter_active = bool(protected_row_start_stops or protected_row_prefixes)
+    if protected_row_filter_active and not protected_filter_stations:
+        print("--protected-row-* filters ignored; no protected stations/groups",
+              flush=True)
+    elif protected_row_filter_active:
+        protected_cover_indices = [
+            i
+            for i, row in enumerate(rows)
+            if protected_filter_stations.intersection(row.get("covered_stations", []))
+        ]
+
+        def _allowed_protected_row(row):
+            if protected_row_start_stops:
+                if str(row.get("start", {}).get("stop", "")) not in protected_row_start_stops:
+                    return False
+            if protected_row_prefixes:
+                column_id = str(row.get("column_id", ""))
+                if not any(column_id.startswith(prefix) for prefix in protected_row_prefixes):
+                    return False
+            return True
+
+        protected_row_allowed_indices = [
+            i for i in protected_cover_indices if _allowed_protected_row(rows[i])
+        ]
+        if not protected_row_allowed_indices:
+            raise SystemExit(
+                "--protected-row-* filters exclude all rows covering protected stations")
+        allowed_set = set(protected_row_allowed_indices)
+        protected_row_forbidden_indices = [
+            i for i in protected_cover_indices if i not in allowed_set
+        ]
+        print("protected row filters: "
+              f"cover_rows={len(protected_cover_indices)} "
+              f"allowed={len(protected_row_allowed_indices)} "
+              f"forbidden={len(protected_row_forbidden_indices)}",
+              flush=True)
     row_by_id = {row.get("column_id"): i for i, row in enumerate(rows)}
     required_column_ids = [
         column_id.strip()
@@ -1217,6 +1782,16 @@ def cmd_exact_cover(args) -> int:
         if column_id.strip()
     ]
     required_row_indices = []
+    required_column_id_prefixes = [
+        prefix.strip()
+        for prefix in str(args.require_column_id_prefix or "").split(",")
+        if prefix.strip()
+    ]
+    required_prefix_groups = _load_prefix_requirement_groups(
+        args.require_column_id_prefix_group)
+    required_pricing_indices = []
+    required_index_groups = []
+    required_neighbor_indices = []
     if required_column_ids:
         missing_required = [
             column_id for column_id in required_column_ids if column_id not in row_by_id
@@ -1225,35 +1800,204 @@ def cmd_exact_cover(args) -> int:
             raise SystemExit(
                 f"--require-column-id missing ids: {missing_required[:8]}")
         required_row_indices = [row_by_id[column_id] for column_id in required_column_ids]
+        required_neighbor_indices.extend(required_row_indices)
         print(f"required column ids: {len(required_row_indices)}", flush=True)
+    for prefix in required_column_id_prefixes:
+        group = [
+            i for i, row in enumerate(rows)
+            if str(row.get("column_id", "")).startswith(prefix)
+        ]
+        min_count = int(args.min_required_column_prefix)
+        if len(group) < min_count:
+            raise SystemExit(
+                f"--require-column-id-prefix {prefix!r} matched {len(group)} "
+                f"column(s), cannot require {min_count}")
+        required_index_groups.append((
+            f"require_prefix_{len(required_index_groups)}",
+            group,
+            min_count,
+        ))
+        required_neighbor_indices.extend(group)
+        print(f"required column prefix {prefix!r}: matched={len(group)} "
+              f"min={min_count}", flush=True)
+    for group_spec in required_prefix_groups:
+        group = [
+            i for i, row in enumerate(rows)
+            if any(
+                str(row.get("column_id", "")).startswith(prefix)
+                for prefix in group_spec["prefixes"]
+            )
+        ]
+        min_count = int(group_spec["min_count"])
+        if len(group) < min_count:
+            raise SystemExit(
+                f"--require-column-id-prefix-group {group_spec['label']!r} "
+                f"matched {len(group)} column(s), cannot require {min_count}")
+        required_index_groups.append((
+            f"require_prefix_group_{len(required_index_groups)}",
+            group,
+            min_count,
+        ))
+        required_neighbor_indices.extend(group)
+        print(
+            f"required column prefix group {group_spec['label']!r}: "
+            f"prefixes={len(group_spec['prefixes'])} matched={len(group)} "
+            f"min={min_count}",
+            flush=True,
+        )
+    if args.require_pricing_kind and args.min_required_pricing:
+        required_pricing_indices = [
+            i for i, row in enumerate(rows)
+            if args.require_pricing_kind in row
+        ]
+        if len(required_pricing_indices) < int(args.min_required_pricing):
+            raise SystemExit(
+                f"--require-pricing-kind {args.require_pricing_kind!r} matched "
+                f"{len(required_pricing_indices)} column(s), cannot require "
+                f"{args.min_required_pricing}")
+        required_neighbor_indices.extend(required_pricing_indices)
+        print(f"required pricing kind {args.require_pricing_kind!r}: "
+              f"matched={len(required_pricing_indices)} "
+              f"min={args.min_required_pricing}", flush=True)
+    protected_neighbor_indices = []
+    if args.protected_arc_top_k:
+        protected_arc_stations = set(protected_stations)
+        for group in protected_station_groups:
+            protected_arc_stations.update(group["stations"])
+        if protected_arc_stations:
+            allowed_protected_set = set(protected_row_allowed_indices)
+            protected_neighbor_indices = sorted({
+                i
+                for i, row in enumerate(rows)
+                if protected_arc_stations.intersection(row.get("covered_stations", []))
+                and (
+                    not protected_row_filter_active
+                    or i in allowed_protected_set
+                )
+            })
+            print(f"protected-neighbor stations={len(protected_arc_stations)} "
+                  f"matched_rows={len(protected_neighbor_indices)} "
+                  f"top_k={args.protected_arc_top_k}", flush=True)
+        else:
+            print("--protected-arc-top-k ignored; no protected stations/groups",
+                  flush=True)
+    if required_neighbor_indices and args.required_arc_top_k:
+        required_arcs = _required_neighbor_exact_arcs(
+            G,
+            tables,
+            rows,
+            runs,
+            D,
+            required_neighbor_indices,
+            top_k=args.required_arc_top_k,
+            max_proxy_s=int(args.max_proxy_hours * 3600),
+            max_connector_s=int(args.max_connector_hours * 3600),
+            cap=args.connector_cap,
+            run_mode=run_mode,
+            run_radius=args.run_radius,
+            cache_path=None if args.no_exact_arc_cache else args.exact_arc_cache,
+            min_same_station_gap_s=args.min_same_station_gap,
+            min_opposite_direction_gap_s=args.min_opposite_direction_gap,
+        )
+        before = len(arcs)
+        arcs = _merge_arcs_min_cost(arcs, required_arcs)
+        print(f"merged required-neighbor arcs: {before} + "
+              f"{len(required_arcs)} -> {len(arcs)}", flush=True)
+    if protected_neighbor_indices and args.protected_arc_top_k:
+        protected_arcs = _required_neighbor_exact_arcs(
+            G,
+            tables,
+            rows,
+            runs,
+            D,
+            protected_neighbor_indices,
+            top_k=args.protected_arc_top_k,
+            max_proxy_s=int(args.max_proxy_hours * 3600),
+            max_connector_s=int(args.max_connector_hours * 3600),
+            cap=args.connector_cap,
+            run_mode=run_mode,
+            run_radius=args.run_radius,
+            cache_path=None if args.no_exact_arc_cache else args.exact_arc_cache,
+            min_same_station_gap_s=args.min_same_station_gap,
+            min_opposite_direction_gap_s=args.min_opposite_direction_gap,
+        )
+        before = len(arcs)
+        arcs = _merge_arcs_min_cost(arcs, protected_arcs)
+        print(f"merged protected-neighbor arcs: {before} + "
+              f"{len(protected_arcs)} -> {len(arcs)}", flush=True)
     hint_order_indices = []
+    ignored_hint_solutions = []
     if args.hint_solution:
-        hint_column_ids = []
-        for hint_path in args.hint_solution:
-            hint_column_ids.extend(_selected_column_ids_from_solution(Path(hint_path)))
-        seen_hint_ids = set()
-        hint_column_ids = [
-            column_id
-            for column_id in hint_column_ids
-            if not (column_id in seen_hint_ids or seen_hint_ids.add(column_id))
-        ]
-        missing_hint = [
-            column_id for column_id in hint_column_ids if column_id not in row_by_id
-        ]
-        hint_order_indices = [
-            row_by_id[column_id]
-            for column_id in hint_column_ids
-            if column_id in row_by_id
-        ]
-        print(f"hint solution columns: {len(hint_order_indices)} "
-              f"missing={len(missing_hint)}", flush=True)
-        if missing_hint:
-            print(f"hint missing e.g. {missing_hint[:8]}", flush=True)
+        hint_paths = [Path(path) for path in args.hint_solution]
+        existing_hint_paths = [path for path in hint_paths if path.exists()]
+        missing_hint_files = [str(path) for path in hint_paths if not path.exists()]
+        if not existing_hint_paths:
+            print("hint solution: no existing hint file found; continuing without hint",
+                  flush=True)
+            if missing_hint_files:
+                print(f"hint files missing e.g. {missing_hint_files[:3]}", flush=True)
+        else:
+            hint_path = existing_hint_paths[0]
+            ignored_hint_solutions = [
+                str(path)
+                for path in hint_paths
+                if path != hint_path
+            ]
+            if ignored_hint_solutions:
+                print(f"hint solution: using {hint_path}; ignoring "
+                      f"{len(ignored_hint_solutions)} extra/missing hint file(s)",
+                      flush=True)
+            if missing_hint_files:
+                print(f"hint files missing e.g. {missing_hint_files[:3]}", flush=True)
+            hint_column_ids = _selected_column_ids_from_solution(hint_path)
+            seen_hint_ids = set()
+            hint_column_ids = [
+                column_id
+                for column_id in hint_column_ids
+                if not (column_id in seen_hint_ids or seen_hint_ids.add(column_id))
+            ]
+            missing_hint = [
+                column_id for column_id in hint_column_ids if column_id not in row_by_id
+            ]
+            hint_order_indices = [
+                row_by_id[column_id]
+                for column_id in hint_column_ids
+                if column_id in row_by_id
+            ]
+            print(f"hint solution columns: {len(hint_order_indices)} "
+                  f"missing={len(missing_hint)}", flush=True)
+            if missing_hint:
+                print(f"hint missing e.g. {missing_hint[:8]}", flush=True)
     if start_window is not None:
         print(f"start time window {start_window}: {len(allowed_start_rows)} eligible columns",
               flush=True)
     if end_window is not None:
         print(f"end time window {end_window}: {len(allowed_end_rows)} eligible columns",
+              flush=True)
+    if max_total_elapsed_s is not None:
+        print(f"max modeled elapsed: {hms(max_total_elapsed_s)}", flush=True)
+    if args.min_covered_count is not None:
+        print(f"min covered count: {args.min_covered_count}", flush=True)
+    if protected_stations:
+        print(f"protected stations: {len(protected_stations)}", flush=True)
+    if protected_station_groups:
+        print("protected station groups: "
+              + ", ".join(
+                  f"{group['label']}={group['min_hits']}/{len(group['stations'])}"
+                  for group in protected_station_groups),
+              flush=True)
+    if uncovered_penalty_groups:
+        print("uncovered penalty groups: "
+              + ", ".join(
+                  f"{group['label']}=+{group['penalty_s']}s/"
+                  f"{len(group['stations'])}"
+                  for group in uncovered_penalty_groups),
+              flush=True)
+    if ordered_station_groups:
+        print("ordered station groups: "
+              + " -> ".join(
+                  f"{group['label']}={group['min_hits']}/{len(group['stations'])}"
+                  for group in ordered_station_groups),
               flush=True)
 
     out = Path(args.out)
@@ -1281,10 +2025,21 @@ def cmd_exact_cover(args) -> int:
             require_pricing_kind=args.require_pricing_kind,
             min_required_pricing=args.min_required_pricing,
             required_row_indices=required_row_indices,
+            required_index_groups=required_index_groups,
             allowed_start_rows=allowed_start_rows,
             allowed_end_rows=allowed_end_rows,
             uncovered_penalty_s=args.uncovered_penalty_s,
+            min_covered_count=args.min_covered_count,
+            max_total_elapsed_s=max_total_elapsed_s,
             hint_order_indices=hint_order_indices,
+            protected_stations=protected_stations,
+            protected_station_groups=protected_station_groups,
+            uncovered_penalty_groups=uncovered_penalty_groups,
+            ordered_station_groups=ordered_station_groups,
+            strict_order_station_groups=args.strict_order_station_groups,
+            first_hit_order_station_groups=args.first_hit_order_station_groups,
+            stop_after_first_solution=args.stop_after_first_solution,
+            forbidden_row_indices=protected_row_forbidden_indices,
         )
         status_name = solver.StatusName(status)
         if not order:
@@ -1298,13 +2053,16 @@ def cmd_exact_cover(args) -> int:
             coverage.update(row.get("covered_stations", []))
             modes.update(row.get("modes", {}))
         relaxed_uncovered = []
-        if args.uncovered_penalty_s:
+        if args.uncovered_penalty_s or uncovered_penalty_groups:
             relaxed_uncovered = sorted(
                 station
                 for station, var in solve_vars.get("covered", {}).items()
                 if not solver.Value(var)
             )
         raw_elapsed = sum(int(row["elapsed_s"]) for row in ordered_rows)
+        modeled_elapsed = None
+        if "elapsed_var" in solve_vars:
+            modeled_elapsed = int(solver.Value(solve_vars["elapsed_var"]))
         active_arc_cost = {}
         for cost, i, j in active_arcs:
             pair = (i, j)
@@ -1321,6 +2079,29 @@ def cmd_exact_cover(args) -> int:
                 "connector_elapsed_s": cost,
                 "connector_elapsed": hms(cost) if cost is not None else None,
             })
+        ordered_group_results = []
+        for group_var in solve_vars.get("ordered_group_vars", []):
+            witness_rows = []
+            for i, var in group_var["witness"]:
+                if solver.Value(var):
+                    witness_rows.append({
+                        "index": int(i),
+                        "column_id": rows[i].get("column_id"),
+                        "order": int(solver.Value(group_var["position"])),
+                        "start": rows[i].get("start"),
+                        "end": rows[i].get("end"),
+                        "hits": sorted(
+                            set(rows[i].get("covered_stations", []))
+                            & set(group_var["group"]["stations"])
+                        ),
+                    })
+            ordered_group_results.append({
+                "label": group_var["group"]["label"],
+                "min_hits": int(group_var["group"]["min_hits"]),
+                "stations": group_var["group"]["stations"],
+                "matched_row_count": len(group_var["candidates"]),
+                "witness_rows": witness_rows,
+            })
         result = {
             "status": status_name,
             "objective_s": int(solver.ObjectiveValue()),
@@ -1329,15 +2110,37 @@ def cmd_exact_cover(args) -> int:
             "covered_count": len(coverage & si.canonical_stations),
             "raw_column_elapsed_s": raw_elapsed,
             "raw_column_elapsed": hms(raw_elapsed),
+            "modeled_elapsed_s": modeled_elapsed,
+            "modeled_elapsed": hms(modeled_elapsed) if modeled_elapsed is not None else None,
+            "max_total_elapsed_s": max_total_elapsed_s,
+            "max_total_elapsed": (
+                hms(max_total_elapsed_s) if max_total_elapsed_s is not None else None
+            ),
             "mode_edges": dict(modes),
             "proxy_cuts": [[rows[i]["column_id"], rows[j]["column_id"]]
                            for i, j in sorted(banned)],
             "uncovered_penalty_s": int(args.uncovered_penalty_s),
+            "min_covered_count": args.min_covered_count,
             "relaxed_uncovered_stations": relaxed_uncovered,
+            "protected_stations": protected_stations,
+            "protected_station_groups": protected_station_groups,
+            "uncovered_penalty_groups": uncovered_penalty_groups,
+            "ordered_station_groups": ordered_group_results,
+            "strict_order_station_groups": bool(args.strict_order_station_groups),
+            "first_hit_order_station_groups": bool(args.first_hit_order_station_groups),
+            "protected_row_start_stops": sorted(protected_row_start_stops),
+            "protected_row_column_id_prefixes": protected_row_prefixes,
+            "protected_row_allowed_count": len(protected_row_allowed_indices),
+            "protected_row_forbidden_count": len(protected_row_forbidden_indices),
             "start_time_window": list(start_window) if start_window is not None else None,
             "end_time_window": list(end_window) if end_window is not None else None,
             "required_column_ids": required_column_ids,
+            "required_column_id_prefixes": required_column_id_prefixes,
+            "min_required_column_prefix": int(args.min_required_column_prefix),
+            "excluded_column_count": len(excluded_rows),
+            "excluded_columns": excluded_rows,
             "hint_solution": list(args.hint_solution or []),
+            "ignored_hint_solutions": ignored_hint_solutions,
             "selected_order": [row.get("column_id") for row in ordered_rows],
             "selected_arcs": selected_arcs,
             "selected_columns": ordered_rows,
@@ -1345,7 +2148,7 @@ def cmd_exact_cover(args) -> int:
         out.write_text(json.dumps(result, sort_keys=True))
         print(f"status={status_name} selected={len(ordered_rows)} "
               f"covered={result['covered_count']}/472 raw={hms(raw_elapsed)} "
-              f"objective={result['objective']}")
+              f"modeled={result['modeled_elapsed']} objective={result['objective']}")
         if relaxed_uncovered:
             print(f"relaxed uncovered={len(relaxed_uncovered)} "
                   f"e.g. {relaxed_uncovered[:12]}")
@@ -1413,6 +2216,1022 @@ def cmd_exact_cover(args) -> int:
             print(result_line(validation), flush=True)
         return 0
     return 1
+
+
+def _source_order_elapsed_s(data, rows, order):
+    if data.get("modeled_elapsed_s") is not None:
+        return int(data["modeled_elapsed_s"])
+    meta = data.get("meta")
+    if isinstance(meta, dict) and meta.get("elapsed_s") is not None:
+        return int(meta["elapsed_s"])
+    total = sum(int(rows[i]["elapsed_s"]) for i in order)
+    for i, j in zip(order, order[1:]):
+        total += _elapsed(rows[i]["end"]["time"], rows[j]["start"]["time"])
+    return int(total)
+
+
+def _replacement_route_is_better(validation, best_validation,
+                                 min_covered_count, max_total_elapsed_s):
+    if validation is None:
+        return False
+    if validation["covered"] < min_covered_count:
+        return False
+    if validation["elapsed_s"] > max_total_elapsed_s:
+        return False
+    if best_validation is None:
+        return True
+    return (
+        int(validation["covered"]),
+        -int(validation["elapsed_s"]),
+    ) > (
+        int(best_validation["covered"]),
+        -int(best_validation["elapsed_s"]),
+    )
+
+
+def cmd_block_replace(args) -> int:
+    import heapq
+    import pickle
+
+    rows = _load_column_rows(Path(args.columns_source))
+    if not rows:
+        raise SystemExit("no columns to search")
+    row_by_id = {row.get("column_id"): i for i, row in enumerate(rows)}
+    source_data = json.loads(Path(args.source_order).read_text())
+    selected_ids = _selected_column_ids_from_solution(Path(args.source_order))
+    missing_selected = [column_id for column_id in selected_ids if column_id not in row_by_id]
+    if missing_selected:
+        raise SystemExit(f"source order has ids not in pool, e.g. {missing_selected[:8]}")
+    selected = [row_by_id[column_id] for column_id in selected_ids]
+    if len(selected) < 2:
+        raise SystemExit("source order must contain at least two columns")
+    selected_set = set(selected)
+
+    si = StationIndex.load()
+    canonical = set(si.canonical_stations)
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    tables = _node_tables(G, si)
+    node_off = tables[0]
+    run_mode = "terminal" if args.terminal_runs else args.run_mode
+    runs, extra_edges = _run_layer_and_metric_edges(
+        G, si, node_off, run_mode, args.run_radius)
+    D, _ = static_station_metric(G, node_off, extra_edges)
+    validation_runs = RunLayer.from_graph(G, radius_m=args.validation_radius)
+    prob = Problem(G, validation_runs, si)
+
+    row_cov = [set(row.get("covered_stations", [])) & canonical for row in rows]
+    selected_cov = [row_cov[i] for i in selected]
+    base_coverage = set().union(*selected_cov)
+    target_stations = set(
+        _parse_station_list(args.target_stations, si, "--target-stations")
+    ) if args.target_stations else (
+        canonical - base_coverage
+    )
+    if not target_stations:
+        raise SystemExit("no target stations to improve")
+    base_elapsed_s = _source_order_elapsed_s(source_data, rows, selected)
+    max_total_elapsed_s = _parse_duration_seconds(args.max_total_elapsed)
+    if max_total_elapsed_s is None:
+        max_total_elapsed_s = base_elapsed_s
+    min_covered_count = (
+        len(base_coverage) + 1
+        if args.min_covered_count is None
+        else int(args.min_covered_count)
+    )
+
+    n = len(selected)
+    row_elapsed = [int(rows[i]["elapsed_s"]) for i in selected]
+    arc_elapsed = [
+        _elapsed(rows[i]["end"]["time"], rows[j]["start"]["time"])
+        for i, j in zip(selected, selected[1:])
+    ]
+    prefix_rows = [0]
+    for value in row_elapsed:
+        prefix_rows.append(prefix_rows[-1] + value)
+    prefix_arcs = [0]
+    for value in arc_elapsed:
+        prefix_arcs.append(prefix_arcs[-1] + value)
+    prefix_cov = []
+    seen = set()
+    for cov in selected_cov:
+        seen = seen | cov
+        prefix_cov.append(set(seen))
+    suffix_cov = [set() for _ in range(n)]
+    seen = set()
+    for idx in range(n - 1, -1, -1):
+        seen = seen | selected_cov[idx]
+        suffix_cov[idx] = set(seen)
+
+    candidates = []
+    checked = 0
+    for k, row in enumerate(rows):
+        if k in selected_set:
+            continue
+        hits = target_stations & row_cov[k]
+        if not hits:
+            continue
+        for p in range(n):
+            prev = rows[selected[p]]
+            static_in = (
+                0 if prev["end"]["station"] == row["start"]["station"]
+                else int(D.get(prev["end"]["station"], {}).get(row["start"]["station"], BIG_COST))
+            )
+            if static_in >= BIG_COST:
+                continue
+            conn_in = _phase_proxy_gap(prev["end"]["time"], row["start"]["time"], static_in)
+            if conn_in >= WEEK:
+                continue
+            for q in range(p + 1, n + 1):
+                conn_out = 0
+                if q < n:
+                    nxt = rows[selected[q]]
+                    static_out = (
+                        0 if row["end"]["station"] == nxt["start"]["station"]
+                        else int(D.get(row["end"]["station"], {}).get(
+                            nxt["start"]["station"], BIG_COST))
+                    )
+                    if static_out >= BIG_COST:
+                        continue
+                    conn_out = _phase_proxy_gap(
+                        row["end"]["time"], nxt["start"]["time"], static_out)
+                    if conn_out >= WEEK:
+                        continue
+                checked += 1
+                arc_prefix_end = q if q < n else n - 1
+                old_span = (
+                    prefix_rows[q] - prefix_rows[p + 1]
+                    + prefix_arcs[arc_prefix_end] - prefix_arcs[p]
+                )
+                new_span = conn_in + int(row["elapsed_s"]) + conn_out
+                new_elapsed_s = base_elapsed_s - old_span + new_span
+                if new_elapsed_s > max_total_elapsed_s:
+                    continue
+                coverage = prefix_cov[p] | (suffix_cov[q] if q < n else set()) | row_cov[k]
+                covered_count = len(coverage)
+                if covered_count < min_covered_count:
+                    continue
+                candidates.append((
+                    -covered_count,
+                    int(new_elapsed_s),
+                    int(new_span - old_span),
+                    q - p - 1,
+                    k,
+                    p,
+                    q,
+                    sorted(hits),
+                    sorted(canonical - coverage),
+                ))
+
+    candidates = heapq.nsmallest(max(0, int(args.max_candidates)), candidates)
+    print(f"block-replace base covered={len(base_coverage)}/472 "
+          f"elapsed={hms(base_elapsed_s)} target_stations={len(target_stations)}",
+          flush=True)
+    print(f"proxy checked={checked} candidates={len(candidates)} "
+          f"min_covered={min_covered_count} max_elapsed={hms(max_total_elapsed_s)}",
+          flush=True)
+
+    summary = {
+        "source_order": args.source_order,
+        "columns_source": args.columns_source,
+        "base_covered_count": len(base_coverage),
+        "base_elapsed_s": base_elapsed_s,
+        "base_elapsed": hms(base_elapsed_s),
+        "target_stations": sorted(target_stations),
+        "min_covered_count": min_covered_count,
+        "max_total_elapsed_s": max_total_elapsed_s,
+        "max_total_elapsed": hms(max_total_elapsed_s),
+        "run_mode": run_mode,
+        "run_radius": args.run_radius,
+        "validation_radius": args.validation_radius,
+        "candidates": [],
+    }
+
+    out_route = Path(args.route_out) if args.route_out else None
+    best_route_validation = None
+    for rank, rec in enumerate(candidates, start=1):
+        neg_covered, proxy_elapsed_s, proxy_delta_s, removed_count, k, p, q, hits, missing = rec
+        order = selected[:p + 1] + [k] + selected[q:]
+        path, failed = _realize_exact_column_path(
+            G, tables, rows, order, validation_runs, args.connector_cap)
+        validation = None
+        route_path = None
+        if path is not None:
+            validation = validate(prob, path)
+            print(f"candidate {rank}: {result_line(validation)} "
+                  f"replacement={rows[k]['column_id']}", flush=True)
+            if (
+                out_route is not None
+                and _replacement_route_is_better(
+                    validation,
+                    best_route_validation,
+                    min_covered_count,
+                    max_total_elapsed_s,
+                )
+            ):
+                out_route.parent.mkdir(parents=True, exist_ok=True)
+                meta = {
+                    "radius_m": args.validation_radius,
+                    "elapsed_s": int(_elapsed(path[0][1], path[-1][1])),
+                    "notes": "One-column block replacement from selected column order",
+                    "source_order": args.source_order,
+                    "columns_source": args.columns_source,
+                    "replacement_column": rows[k]["column_id"],
+                    "replaced_after": rows[selected[p]]["column_id"],
+                    "replaced_before": (
+                        rows[selected[q]]["column_id"] if q < n else None
+                    ),
+                    "removed_columns": [rows[idx]["column_id"] for idx in selected[p + 1:q]],
+                    "proxy_covered_count": -neg_covered,
+                    "proxy_missing_stations": missing,
+                    "proxy_elapsed_s": proxy_elapsed_s,
+                    "proxy_elapsed": hms(proxy_elapsed_s),
+                    "selected_order": [rows[idx]["column_id"] for idx in order],
+                }
+                out_route.write_text(json.dumps({"meta": meta, "path": path}, sort_keys=True))
+                route_path = str(out_route)
+                best_route_validation = validation
+                print(f"wrote {out_route}", flush=True)
+                if args.stop_after_first:
+                    summary["candidates"].append({
+                        "rank": rank,
+                        "replacement_column": rows[k]["column_id"],
+                        "proxy_covered_count": -neg_covered,
+                        "proxy_elapsed_s": proxy_elapsed_s,
+                        "proxy_delta_s": proxy_delta_s,
+                        "removed_count": removed_count,
+                        "target_hits": hits,
+                        "failed_arc": failed,
+                        "validation": validation,
+                        "route_out": route_path,
+                    })
+                    break
+        else:
+            print(f"candidate {rank}: failed replacement={rows[k]['column_id']} "
+                  f"failed_arc={failed}", flush=True)
+        summary["candidates"].append({
+            "rank": rank,
+            "replacement_column": rows[k]["column_id"],
+            "replaced_after": rows[selected[p]]["column_id"],
+            "replaced_before": rows[selected[q]]["column_id"] if q < n else None,
+            "removed_columns": [rows[idx]["column_id"] for idx in selected[p + 1:q]],
+            "proxy_covered_count": -neg_covered,
+            "proxy_elapsed_s": proxy_elapsed_s,
+            "proxy_elapsed": hms(proxy_elapsed_s),
+            "proxy_delta_s": proxy_delta_s,
+            "removed_count": removed_count,
+            "target_hits": hits,
+            "proxy_missing_stations": missing,
+            "failed_arc": list(failed) if failed is not None else None,
+            "validation": validation,
+            "route_out": route_path,
+        })
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(summary, sort_keys=True))
+        print(f"wrote {out}", flush=True)
+    return 0
+
+
+def _column_id_prefixes(value):
+    return [prefix.strip() for prefix in str(value or "").split(",") if prefix.strip()]
+
+
+def _matches_any_prefix(row, prefixes):
+    if not prefixes:
+        return True
+    column_id = str(row.get("column_id", ""))
+    return any(column_id.startswith(prefix) for prefix in prefixes)
+
+
+def _replacement_source_state(args):
+    rows = _load_column_rows(Path(args.columns_source))
+    if not rows:
+        raise SystemExit("no columns to search")
+    row_by_id = {row.get("column_id"): i for i, row in enumerate(rows)}
+    source_data = json.loads(Path(args.source_order).read_text())
+    selected_ids = _selected_column_ids_from_solution(Path(args.source_order))
+    missing_selected = [column_id for column_id in selected_ids if column_id not in row_by_id]
+    if missing_selected:
+        raise SystemExit(f"source order has ids not in pool, e.g. {missing_selected[:8]}")
+    selected = [row_by_id[column_id] for column_id in selected_ids]
+    if len(selected) < 2:
+        raise SystemExit("source order must contain at least two columns")
+    missing_path = [
+        row.get("column_id", str(i))
+        for i, row in enumerate(rows)
+        if "path" not in row
+    ]
+    if missing_path:
+        raise SystemExit(f"{len(missing_path)} columns have no path slices, e.g. {missing_path[:8]}")
+    return rows, source_data, selected
+
+
+def _selected_route_series(rows, selected):
+    row_elapsed = [int(rows[i]["elapsed_s"]) for i in selected]
+    arc_elapsed = [
+        _elapsed(rows[i]["end"]["time"], rows[j]["start"]["time"])
+        for i, j in zip(selected, selected[1:])
+    ]
+    prefix_rows = [0]
+    for value in row_elapsed:
+        prefix_rows.append(prefix_rows[-1] + value)
+    prefix_arcs = [0]
+    for value in arc_elapsed:
+        prefix_arcs.append(prefix_arcs[-1] + value)
+    return prefix_rows, prefix_arcs
+
+
+def _old_selected_span_elapsed(prefix_rows, prefix_arcs, n, start, end):
+    p = start - 1
+    arc_prefix_end = end if end < n else n - 1
+    return (
+        prefix_rows[end] - prefix_rows[start]
+        + prefix_arcs[arc_prefix_end] - prefix_arcs[p]
+    )
+
+
+def cmd_pair_replace(args) -> int:
+    import heapq
+    import pickle
+
+    rows, source_data, selected = _replacement_source_state(args)
+    selected_set = set(selected)
+
+    si = StationIndex.load()
+    canonical = set(si.canonical_stations)
+    row_cov = [set(row.get("covered_stations", [])) & canonical for row in rows]
+    selected_cov = [row_cov[i] for i in selected]
+    base_coverage = set().union(*selected_cov)
+    target_stations = set(
+        _parse_station_list(args.target_stations, si, "--target-stations")
+    ) if args.target_stations else (
+        canonical - base_coverage
+    )
+    if not target_stations:
+        raise SystemExit("no target stations to improve")
+    base_elapsed_s = _source_order_elapsed_s(source_data, rows, selected)
+    max_total_elapsed_s = _parse_duration_seconds(args.max_total_elapsed)
+    if max_total_elapsed_s is None:
+        max_total_elapsed_s = base_elapsed_s
+    min_covered_count = (
+        len(base_coverage) + 1
+        if args.min_covered_count is None
+        else int(args.min_covered_count)
+    )
+
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    tables = _node_tables(G, si)
+    node_off = tables[0]
+    run_mode = "terminal" if args.terminal_runs else args.run_mode
+    runs, extra_edges = _run_layer_and_metric_edges(
+        G, si, node_off, run_mode, args.run_radius)
+    D, _ = static_station_metric(G, node_off, extra_edges)
+    validation_runs = RunLayer.from_graph(G, radius_m=args.validation_radius)
+    prob = Problem(G, validation_runs, si)
+
+    n = len(selected)
+    prefix_rows, prefix_arcs = _selected_route_series(rows, selected)
+    prefix_cov = []
+    seen = set()
+    for cov in selected_cov:
+        seen = seen | cov
+        prefix_cov.append(set(seen))
+    suffix_cov = [set() for _ in range(n)]
+    seen = set()
+    for idx in range(n - 1, -1, -1):
+        seen = seen | selected_cov[idx]
+        suffix_cov[idx] = set(seen)
+
+    shared_prefixes = _column_id_prefixes(args.column_id_prefix)
+    first_prefixes = _column_id_prefixes(args.first_column_id_prefix) or shared_prefixes
+    second_prefixes = _column_id_prefixes(args.second_column_id_prefix) or shared_prefixes
+
+    def candidate_rows(prefixes, max_rows):
+        candidates = []
+        for i, row in enumerate(rows):
+            if i in selected_set or not _matches_any_prefix(row, prefixes):
+                continue
+            hits = row_cov[i] & target_stations
+            if not hits and not args.include_non_target_candidates:
+                continue
+            candidates.append((
+                -len(hits),
+                -len(row_cov[i]),
+                int(row["elapsed_s"]),
+                str(row.get("column_id", "")),
+                i,
+            ))
+        candidates.sort()
+        if max_rows:
+            candidates = candidates[:max_rows]
+        return [i for *_sort, i in candidates]
+
+    first_candidates = candidate_rows(first_prefixes, args.max_first_rows)
+    second_candidates = candidate_rows(second_prefixes, args.max_second_rows)
+    if not first_candidates or not second_candidates:
+        raise SystemExit(
+            f"no candidate rows after filtering: first={len(first_candidates)} "
+            f"second={len(second_candidates)}")
+
+    min_start = max(1, int(args.min_replace_start_index))
+    max_start = int(args.max_replace_start_index or (n - 1))
+    max_start = min(max_start, n - 1)
+    min_end_arg = int(args.min_replace_end_index or 0)
+    max_end = int(args.max_replace_end_index or n)
+    max_end = min(max_end, n)
+    if min_start > max_start:
+        raise SystemExit("replacement start-index window is empty")
+
+    proxy_cache = {}
+
+    def proxy(i, j):
+        key = (i, j)
+        if key not in proxy_cache:
+            proxy_cache[key] = _candidate_exact_arc_proxy(
+                rows,
+                D,
+                i,
+                j,
+                min_same_station_gap_s=args.min_same_station_gap,
+                min_opposite_direction_gap_s=args.min_opposite_direction_gap,
+            )
+        return proxy_cache[key]
+
+    candidates = []
+    checked = 0
+    proxy_feasible = 0
+    elapsed_feasible = 0
+    for start in range(min_start, max_start + 1):
+        end_min = max(start + int(args.min_removed_count), min_end_arg or start + 1)
+        end_max = max_end
+        if args.max_removed_count:
+            end_max = min(end_max, start + int(args.max_removed_count))
+        if end_min > end_max:
+            continue
+        p = start - 1
+        prev_idx = selected[p]
+        for end in range(end_min, end_max + 1):
+            if end <= start or end > n:
+                continue
+            q_idx = selected[end] if end < n else None
+            old_span = _old_selected_span_elapsed(prefix_rows, prefix_arcs, n, start, end)
+            outside_cov = prefix_cov[p] | (suffix_cov[end] if end < n else set())
+            for first_idx in first_candidates:
+                conn_in = proxy(prev_idx, first_idx)
+                if conn_in is None:
+                    continue
+                for second_idx in second_candidates:
+                    if second_idx == first_idx:
+                        continue
+                    checked += 1
+                    conn_mid = proxy(first_idx, second_idx)
+                    if conn_mid is None:
+                        continue
+                    conn_out = 0
+                    if q_idx is not None:
+                        conn_out = proxy(second_idx, q_idx)
+                        if conn_out is None:
+                            continue
+                    proxy_feasible += 1
+                    new_span = (
+                        int(conn_in)
+                        + int(rows[first_idx]["elapsed_s"])
+                        + int(conn_mid)
+                        + int(rows[second_idx]["elapsed_s"])
+                        + int(conn_out)
+                    )
+                    new_elapsed_s = base_elapsed_s - old_span + new_span
+                    if new_elapsed_s > max_total_elapsed_s:
+                        continue
+                    elapsed_feasible += 1
+                    coverage = outside_cov | row_cov[first_idx] | row_cov[second_idx]
+                    covered_count = len(coverage)
+                    if covered_count < min_covered_count:
+                        continue
+                    hits = sorted((row_cov[first_idx] | row_cov[second_idx]) & target_stations)
+                    candidates.append((
+                        -covered_count,
+                        int(new_elapsed_s),
+                        int(new_span - old_span),
+                        end - start,
+                        first_idx,
+                        second_idx,
+                        start,
+                        end,
+                        hits,
+                        sorted(canonical - coverage),
+                    ))
+        if args.progress_every_starts and (
+            (start - min_start + 1) % int(args.progress_every_starts) == 0
+            or start == max_start
+        ):
+            print(f"pair-replace progress start={start}/{max_start} "
+                  f"checked={checked} candidates={len(candidates)}",
+                  flush=True)
+
+    candidates = heapq.nsmallest(max(0, int(args.max_candidates)), candidates)
+    print(f"pair-replace base covered={len(base_coverage)}/472 "
+          f"elapsed={hms(base_elapsed_s)} target_stations={len(target_stations)}",
+          flush=True)
+    print(f"candidate rows first={len(first_candidates)} second={len(second_candidates)} "
+          f"start_index={min_start}-{max_start} end_max={max_end}", flush=True)
+    print(f"proxy checked={checked} feasible={proxy_feasible} "
+          f"elapsed_feasible={elapsed_feasible} candidates={len(candidates)} "
+          f"min_covered={min_covered_count} max_elapsed={hms(max_total_elapsed_s)}",
+          flush=True)
+
+    summary = {
+        "source_order": args.source_order,
+        "columns_source": args.columns_source,
+        "base_covered_count": len(base_coverage),
+        "base_elapsed_s": base_elapsed_s,
+        "base_elapsed": hms(base_elapsed_s),
+        "target_stations": sorted(target_stations),
+        "min_covered_count": min_covered_count,
+        "max_total_elapsed_s": max_total_elapsed_s,
+        "max_total_elapsed": hms(max_total_elapsed_s),
+        "run_mode": run_mode,
+        "run_radius": args.run_radius,
+        "validation_radius": args.validation_radius,
+        "first_candidate_count": len(first_candidates),
+        "second_candidate_count": len(second_candidates),
+        "checked": checked,
+        "proxy_feasible": proxy_feasible,
+        "elapsed_feasible": elapsed_feasible,
+        "candidates": [],
+    }
+
+    out_route = Path(args.route_out) if args.route_out else None
+    best_route_validation = None
+    for rank, rec in enumerate(candidates, start=1):
+        neg_covered, proxy_elapsed_s, proxy_delta_s, removed_count, first_idx, second_idx, start, end, hits, missing = rec
+        order = selected[:start] + [first_idx, second_idx] + selected[end:]
+        path, failed = _realize_exact_column_path(
+            G, tables, rows, order, validation_runs, args.connector_cap)
+        validation = None
+        route_path = None
+        if path is not None:
+            validation = validate(prob, path)
+            print(f"candidate {rank}: {result_line(validation)} "
+                  f"replacement={rows[first_idx]['column_id']} + "
+                  f"{rows[second_idx]['column_id']}", flush=True)
+            if (
+                out_route is not None
+                and _replacement_route_is_better(
+                    validation,
+                    best_route_validation,
+                    min_covered_count,
+                    max_total_elapsed_s,
+                )
+            ):
+                out_route.parent.mkdir(parents=True, exist_ok=True)
+                meta = {
+                    "radius_m": args.validation_radius,
+                    "elapsed_s": int(_elapsed(path[0][1], path[-1][1])),
+                    "notes": "Two-column block replacement from selected column order",
+                    "source_order": args.source_order,
+                    "columns_source": args.columns_source,
+                    "replacement_columns": [
+                        rows[first_idx]["column_id"],
+                        rows[second_idx]["column_id"],
+                    ],
+                    "replaced_after": rows[selected[start - 1]]["column_id"],
+                    "replaced_before": rows[selected[end]]["column_id"] if end < n else None,
+                    "removed_columns": [rows[idx]["column_id"] for idx in selected[start:end]],
+                    "proxy_covered_count": -neg_covered,
+                    "proxy_missing_stations": missing,
+                    "proxy_elapsed_s": proxy_elapsed_s,
+                    "proxy_elapsed": hms(proxy_elapsed_s),
+                    "selected_order": [rows[idx]["column_id"] for idx in order],
+                }
+                out_route.write_text(json.dumps({"meta": meta, "path": path}, sort_keys=True))
+                route_path = str(out_route)
+                best_route_validation = validation
+                print(f"wrote {out_route}", flush=True)
+                if args.stop_after_first:
+                    summary["candidates"].append({
+                        "rank": rank,
+                        "replacement_columns": [
+                            rows[first_idx]["column_id"],
+                            rows[second_idx]["column_id"],
+                        ],
+                        "proxy_covered_count": -neg_covered,
+                        "proxy_elapsed_s": proxy_elapsed_s,
+                        "proxy_delta_s": proxy_delta_s,
+                        "removed_count": removed_count,
+                        "target_hits": hits,
+                        "failed_arc": failed,
+                        "validation": validation,
+                        "route_out": route_path,
+                    })
+                    break
+        else:
+            print(f"candidate {rank}: failed replacement={rows[first_idx]['column_id']} "
+                  f"+ {rows[second_idx]['column_id']} failed_arc={failed}",
+                  flush=True)
+        summary["candidates"].append({
+            "rank": rank,
+            "replacement_columns": [
+                rows[first_idx]["column_id"],
+                rows[second_idx]["column_id"],
+            ],
+            "replaced_after": rows[selected[start - 1]]["column_id"],
+            "replaced_before": rows[selected[end]]["column_id"] if end < n else None,
+            "removed_columns": [rows[idx]["column_id"] for idx in selected[start:end]],
+            "proxy_covered_count": -neg_covered,
+            "proxy_elapsed_s": proxy_elapsed_s,
+            "proxy_elapsed": hms(proxy_elapsed_s),
+            "proxy_delta_s": proxy_delta_s,
+            "removed_count": removed_count,
+            "target_hits": hits,
+            "proxy_missing_stations": missing,
+            "failed_arc": list(failed) if failed is not None else None,
+            "validation": validation,
+            "route_out": route_path,
+        })
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(summary, sort_keys=True))
+        print(f"wrote {out}", flush=True)
+    return 0
+
+
+def cmd_chain_replace(args) -> int:
+    import heapq
+    import pickle
+
+    replacement_count = int(args.replacement_count)
+    if replacement_count < 1:
+        raise SystemExit("--replacement-count must be positive")
+
+    rows, source_data, selected = _replacement_source_state(args)
+    selected_set = set(selected)
+
+    si = StationIndex.load()
+    canonical = set(si.canonical_stations)
+    row_cov = [set(row.get("covered_stations", [])) & canonical for row in rows]
+    selected_cov = [row_cov[i] for i in selected]
+    base_coverage = set().union(*selected_cov)
+    target_stations = set(
+        _parse_station_list(args.target_stations, si, "--target-stations")
+    ) if args.target_stations else (
+        canonical - base_coverage
+    )
+    if not target_stations:
+        raise SystemExit("no target stations to improve")
+    base_elapsed_s = _source_order_elapsed_s(source_data, rows, selected)
+    max_total_elapsed_s = _parse_duration_seconds(args.max_total_elapsed)
+    if max_total_elapsed_s is None:
+        max_total_elapsed_s = base_elapsed_s
+    min_covered_count = (
+        len(base_coverage) + 1
+        if args.min_covered_count is None
+        else int(args.min_covered_count)
+    )
+
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    tables = _node_tables(G, si)
+    node_off = tables[0]
+    run_mode = "terminal" if args.terminal_runs else args.run_mode
+    runs, extra_edges = _run_layer_and_metric_edges(
+        G, si, node_off, run_mode, args.run_radius)
+    D, _ = static_station_metric(G, node_off, extra_edges)
+    validation_runs = RunLayer.from_graph(G, radius_m=args.validation_radius)
+    prob = Problem(G, validation_runs, si)
+
+    n = len(selected)
+    prefix_rows, prefix_arcs = _selected_route_series(rows, selected)
+    prefix_cov = []
+    seen = set()
+    for cov in selected_cov:
+        seen = seen | cov
+        prefix_cov.append(frozenset(seen))
+    suffix_cov = [frozenset() for _ in range(n)]
+    seen = set()
+    for idx in range(n - 1, -1, -1):
+        seen = seen | selected_cov[idx]
+        suffix_cov[idx] = frozenset(seen)
+
+    candidate_prefixes = _column_id_prefixes(args.column_id_prefix)
+    position_prefixes = []
+    if args.chain_column_id_prefixes:
+        position_prefixes = [
+            _column_id_prefixes(part)
+            for part in str(args.chain_column_id_prefixes).split(";")
+        ]
+        if len(position_prefixes) != replacement_count:
+            raise SystemExit(
+                "--chain-column-id-prefixes must contain one semicolon-separated "
+                "prefix group per replacement position")
+
+    def ranked_candidates(prefixes):
+        candidate_rows = []
+        for i, row in enumerate(rows):
+            if i in selected_set or not _matches_any_prefix(row, prefixes):
+                continue
+            hits = row_cov[i] & target_stations
+            if not hits and not args.include_non_target_candidates:
+                continue
+            candidate_rows.append((
+                -len(hits),
+                -len(row_cov[i]),
+                int(row["elapsed_s"]),
+                str(row.get("column_id", "")),
+                i,
+            ))
+        by_index = {}
+        for rec in sorted(candidate_rows)[:max(0, int(args.max_candidate_rows))]:
+            by_index[rec[-1]] = rec
+        if args.extra_fast_candidate_rows:
+            for rec in sorted(
+                candidate_rows,
+                key=lambda item: (item[2], item[0], item[1], item[3]),
+            )[:int(args.extra_fast_candidate_rows)]:
+                by_index[rec[-1]] = rec
+        return [i for *_sort, i in sorted(by_index.values())]
+
+    if position_prefixes:
+        candidates_by_depth = [
+            ranked_candidates(prefixes)
+            for prefixes in position_prefixes
+        ]
+        empty_depths = [
+            idx + 1 for idx, indices in enumerate(candidates_by_depth) if not indices
+        ]
+        if empty_depths:
+            raise SystemExit(
+                "--chain-column-id-prefixes produced no candidates at "
+                f"position(s) {empty_depths}")
+        candidates_idx = sorted(set().union(*map(set, candidates_by_depth)))
+    else:
+        candidates_idx = ranked_candidates(candidate_prefixes)
+        candidates_by_depth = [candidates_idx for _ in range(replacement_count)]
+        if len(candidates_idx) < replacement_count:
+            raise SystemExit(
+                f"need at least {replacement_count} candidate rows after filtering; "
+                f"got {len(candidates_idx)}")
+
+    min_start = max(1, int(args.min_replace_start_index))
+    max_start = int(args.max_replace_start_index or (n - 1))
+    max_start = min(max_start, n - 1)
+    min_end_arg = int(args.min_replace_end_index or 0)
+    max_end = int(args.max_replace_end_index or n)
+    max_end = min(max_end, n)
+    if min_start > max_start:
+        raise SystemExit("replacement start-index window is empty")
+
+    row_elapsed = [int(row["elapsed_s"]) for row in rows]
+    proxy_cache = {}
+
+    def proxy(i, j):
+        key = (i, j)
+        if key not in proxy_cache:
+            proxy_cache[key] = _candidate_exact_arc_proxy(
+                rows,
+                D,
+                i,
+                j,
+                min_same_station_gap_s=args.min_same_station_gap,
+                min_opposite_direction_gap_s=args.min_opposite_direction_gap,
+            )
+        return proxy_cache[key]
+
+    def state_key(span, cov, chain):
+        hits = len(cov & target_stations)
+        return (
+            int(span)
+            - int(args.target_reward_s) * hits
+            - int(args.cover_reward_s) * len(cov),
+            int(span),
+            -hits,
+            -len(cov),
+            tuple(rows[i].get("column_id", "") for i in chain),
+        )
+
+    candidate_heap = []
+    checked_extensions = 0
+    final_checked = 0
+    elapsed_feasible = 0
+    blocks_scanned = 0
+
+    for start in range(min_start, max_start + 1):
+        end_min = max(start + int(args.min_removed_count), min_end_arg or start + 1)
+        end_max = max_end
+        if args.max_removed_count:
+            end_max = min(end_max, start + int(args.max_removed_count))
+        if end_min > end_max:
+            continue
+        p = start - 1
+        prev_left = selected[p]
+        for end in range(end_min, end_max + 1):
+            if end <= start or end > n:
+                continue
+            blocks_scanned += 1
+            q_idx = selected[end] if end < n else None
+            old_span = _old_selected_span_elapsed(prefix_rows, prefix_arcs, n, start, end)
+            outside_cov = prefix_cov[p] | (suffix_cov[end] if end < n else frozenset())
+            states = [(0, (), outside_cov)]
+            for _depth in range(replacement_count):
+                next_states = []
+                seen_state_keys = set()
+                depth_candidates = candidates_by_depth[_depth]
+                for span, chain, cov in states:
+                    prev_idx = prev_left if not chain else chain[-1]
+                    used = set(chain)
+                    for row_idx in depth_candidates:
+                        if row_idx in used:
+                            continue
+                        checked_extensions += 1
+                        conn = proxy(prev_idx, row_idx)
+                        if conn is None:
+                            continue
+                        new_span = int(span) + int(conn) + row_elapsed[row_idx]
+                        if base_elapsed_s - old_span + new_span > max_total_elapsed_s:
+                            continue
+                        new_chain = chain + (row_idx,)
+                        new_cov = cov | frozenset(row_cov[row_idx])
+                        dedupe_key = (
+                            row_idx,
+                            tuple(sorted(new_cov & target_stations)),
+                            int(new_span // max(1, int(args.time_bucket_s))),
+                        )
+                        if dedupe_key in seen_state_keys:
+                            continue
+                        seen_state_keys.add(dedupe_key)
+                        next_states.append((new_span, new_chain, new_cov))
+                next_states.sort(key=lambda item: state_key(item[0], item[2], item[1]))
+                states = next_states[:int(args.beam_size)]
+                if not states:
+                    break
+            for span, chain, cov in states:
+                final_checked += 1
+                conn_out = 0
+                if q_idx is not None:
+                    conn_out = proxy(chain[-1], q_idx)
+                    if conn_out is None:
+                        continue
+                chain_span = int(span) + int(conn_out)
+                new_elapsed_s = base_elapsed_s - old_span + chain_span
+                if new_elapsed_s > max_total_elapsed_s:
+                    continue
+                elapsed_feasible += 1
+                covered_count = len(cov)
+                if covered_count < min_covered_count:
+                    continue
+                hits = sorted(set().union(*(row_cov[i] for i in chain)) & target_stations)
+                rec = (
+                    -covered_count,
+                    int(new_elapsed_s),
+                    int(chain_span - old_span),
+                    end - start,
+                    chain,
+                    start,
+                    end,
+                    hits,
+                    sorted(canonical - set(cov)),
+                )
+                heapq.heappush(candidate_heap, rec)
+                if len(candidate_heap) > max(1, int(args.keep_proxy_candidates)):
+                    candidate_heap = heapq.nsmallest(
+                        int(args.keep_proxy_candidates), candidate_heap)
+                    heapq.heapify(candidate_heap)
+        if args.progress_every_starts and (
+            (start - min_start + 1) % int(args.progress_every_starts) == 0
+            or start == max_start
+        ):
+            print(f"chain-replace progress start={start}/{max_start} "
+                  f"blocks={blocks_scanned} extensions={checked_extensions} "
+                  f"proxy_candidates={len(candidate_heap)}",
+                  flush=True)
+
+    proxy_candidates = heapq.nsmallest(max(0, int(args.max_candidates)), candidate_heap)
+    print(f"chain-replace base covered={len(base_coverage)}/472 "
+          f"elapsed={hms(base_elapsed_s)} target_stations={len(target_stations)}",
+          flush=True)
+    print(f"candidate rows={len(candidates_idx)} replacement_count={replacement_count} "
+          f"beam={args.beam_size} blocks={blocks_scanned}", flush=True)
+    print(f"extensions={checked_extensions} final_states={final_checked} "
+          f"elapsed_feasible={elapsed_feasible} candidates={len(proxy_candidates)} "
+          f"min_covered={min_covered_count} max_elapsed={hms(max_total_elapsed_s)}",
+          flush=True)
+
+    summary = {
+        "source_order": args.source_order,
+        "columns_source": args.columns_source,
+        "base_covered_count": len(base_coverage),
+        "base_elapsed_s": base_elapsed_s,
+        "base_elapsed": hms(base_elapsed_s),
+        "target_stations": sorted(target_stations),
+        "min_covered_count": min_covered_count,
+        "max_total_elapsed_s": max_total_elapsed_s,
+        "max_total_elapsed": hms(max_total_elapsed_s),
+        "run_mode": run_mode,
+        "run_radius": args.run_radius,
+        "validation_radius": args.validation_radius,
+        "candidate_count": len(candidates_idx),
+        "position_candidate_counts": [len(indices) for indices in candidates_by_depth],
+        "chain_column_id_prefixes": args.chain_column_id_prefixes,
+        "replacement_count": replacement_count,
+        "beam_size": int(args.beam_size),
+        "blocks_scanned": blocks_scanned,
+        "checked_extensions": checked_extensions,
+        "final_states": final_checked,
+        "elapsed_feasible": elapsed_feasible,
+        "candidates": [],
+    }
+
+    out_route = Path(args.route_out) if args.route_out else None
+    best_route_validation = None
+    for rank, rec in enumerate(proxy_candidates, start=1):
+        neg_covered, proxy_elapsed_s, proxy_delta_s, removed_count, chain, start, end, hits, missing = rec
+        order = selected[:start] + list(chain) + selected[end:]
+        path, failed = _realize_exact_column_path(
+            G, tables, rows, order, validation_runs, args.connector_cap)
+        validation = None
+        route_path = None
+        replacement_columns = [rows[i]["column_id"] for i in chain]
+        if path is not None:
+            validation = validate(prob, path)
+            print(f"candidate {rank}: {result_line(validation)} "
+                  f"replacement={replacement_columns}", flush=True)
+            if (
+                out_route is not None
+                and _replacement_route_is_better(
+                    validation,
+                    best_route_validation,
+                    min_covered_count,
+                    max_total_elapsed_s,
+                )
+            ):
+                out_route.parent.mkdir(parents=True, exist_ok=True)
+                meta = {
+                    "radius_m": args.validation_radius,
+                    "elapsed_s": int(_elapsed(path[0][1], path[-1][1])),
+                    "notes": "Beam-screened multi-column block replacement",
+                    "source_order": args.source_order,
+                    "columns_source": args.columns_source,
+                    "replacement_columns": replacement_columns,
+                    "replaced_after": rows[selected[start - 1]]["column_id"],
+                    "replaced_before": rows[selected[end]]["column_id"] if end < n else None,
+                    "removed_columns": [rows[idx]["column_id"] for idx in selected[start:end]],
+                    "proxy_covered_count": -neg_covered,
+                    "proxy_missing_stations": missing,
+                    "proxy_elapsed_s": proxy_elapsed_s,
+                    "proxy_elapsed": hms(proxy_elapsed_s),
+                    "selected_order": [rows[idx]["column_id"] for idx in order],
+                }
+                out_route.write_text(json.dumps({"meta": meta, "path": path}, sort_keys=True))
+                route_path = str(out_route)
+                best_route_validation = validation
+                print(f"wrote {out_route}", flush=True)
+                if args.stop_after_first:
+                    summary["candidates"].append({
+                        "rank": rank,
+                        "replacement_columns": replacement_columns,
+                        "proxy_covered_count": -neg_covered,
+                        "proxy_elapsed_s": proxy_elapsed_s,
+                        "proxy_delta_s": proxy_delta_s,
+                        "removed_count": removed_count,
+                        "target_hits": hits,
+                        "failed_arc": failed,
+                        "validation": validation,
+                        "route_out": route_path,
+                    })
+                    break
+        else:
+            print(f"candidate {rank}: failed replacement={replacement_columns} "
+                  f"failed_arc={failed}", flush=True)
+        summary["candidates"].append({
+            "rank": rank,
+            "replacement_columns": replacement_columns,
+            "replaced_after": rows[selected[start - 1]]["column_id"],
+            "replaced_before": rows[selected[end]]["column_id"] if end < n else None,
+            "removed_columns": [rows[idx]["column_id"] for idx in selected[start:end]],
+            "proxy_covered_count": -neg_covered,
+            "proxy_elapsed_s": proxy_elapsed_s,
+            "proxy_elapsed": hms(proxy_elapsed_s),
+            "proxy_delta_s": proxy_delta_s,
+            "removed_count": removed_count,
+            "target_hits": hits,
+            "proxy_missing_stations": missing,
+            "failed_arc": list(failed) if failed is not None else None,
+            "validation": validation,
+            "route_out": route_path,
+        })
+
+    if args.out:
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(summary, sort_keys=True))
+        print(f"wrote {out}", flush=True)
+    return 0
 
 
 def cmd_price_terminals(args) -> int:
@@ -1646,6 +3465,10 @@ def _row_pricing_reduced_cost(row):
         values.append(float(row["pricing_cluster_corridor"]["score_s"]))
     if "pricing_late_tail_beam" in row and "score_s" in row["pricing_late_tail_beam"]:
         values.append(float(row["pricing_late_tail_beam"]["score_s"]))
+    if "pricing_resource_chain" in row and "score_s" in row["pricing_resource_chain"]:
+        values.append(float(row["pricing_resource_chain"]["score_s"]))
+    if "pricing_stage_chain" in row and "score_s" in row["pricing_stage_chain"]:
+        values.append(float(row["pricing_stage_chain"]["score_s"]))
     return min(values) if values else None
 
 
@@ -1680,12 +3503,9 @@ def cmd_active_pool(args) -> int:
     missing_solution_ids = []
 
     for solution_path in args.include_solution or []:
-        solution_rows = _load_column_rows(Path(solution_path))
+        solution_ids = _selected_column_ids_from_solution(Path(solution_path))
         label = f"solution:{Path(solution_path).name}"
-        for row in solution_rows:
-            column_id = row.get("column_id")
-            if not column_id:
-                continue
+        for column_id in solution_ids:
             if column_id in by_id:
                 selected.add(column_id)
                 reasons[column_id].add(label)
@@ -1780,6 +3600,29 @@ def cmd_active_pool(args) -> int:
 def _parse_minutes_to_seconds(value):
     return [int(round(float(x.strip()) * 60))
             for x in str(value).split(",") if x.strip()]
+
+
+def _parse_duration_seconds(value):
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if ":" not in raw:
+        return int(round(float(raw)))
+    parts = raw.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"duration must be seconds, MM:SS, or HH:MM:SS, got {value!r}")
+    try:
+        values = [int(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError(f"duration contains a non-integer field: {value!r}") from exc
+    if any(part < 0 for part in values):
+        raise ValueError(f"duration fields must be non-negative: {value!r}")
+    total = 0
+    for part in values:
+        total = total * 60 + part
+    return total
 
 
 def _parse_week_time_window(value):
@@ -3260,6 +5103,1321 @@ def _parse_station_list(value, si, name):
     return stations
 
 
+def _load_anchor_sequences(args, si):
+    sequences = []
+    if args.anchor_sequences:
+        for raw_sequence in str(args.anchor_sequences).split(";"):
+            raw_sequence = raw_sequence.strip()
+            if not raw_sequence:
+                continue
+            sequences.append(
+                _parse_station_list(raw_sequence, si, "--anchor-sequences")
+            )
+    if args.anchor_sequences_file:
+        data = json.loads(Path(args.anchor_sequences_file).read_text())
+        if not isinstance(data, list):
+            raise SystemExit("--anchor-sequences-file must contain a JSON list")
+        for item in data:
+            if isinstance(item, str):
+                sequences.append(_parse_station_list(item, si, "--anchor-sequences-file"))
+            elif isinstance(item, list):
+                sequence = [str(station) for station in item]
+                bad = [station for station in sequence if station not in si.canonical_stations]
+                if bad:
+                    raise SystemExit(
+                        "--anchor-sequences-file contains non-canonical station ids, "
+                        f"e.g. {bad[:8]}")
+                sequences.append(sequence)
+            else:
+                raise SystemExit(
+                    "--anchor-sequences-file entries must be strings or station-id lists")
+    if not sequences:
+        raise SystemExit("provide --anchor-sequences or --anchor-sequences-file")
+    seen = set()
+    unique = []
+    for sequence in sequences:
+        key = tuple(sequence)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(sequence)
+    return unique
+
+
+def cmd_price_anchor_sequences(args) -> int:
+    import pickle
+
+    base_rows = _load_column_rows(Path(args.base_columns)) if args.base_columns else []
+    source_rows = _load_column_rows(Path(args.source_columns))
+
+    si = StationIndex.load()
+    sequences = _load_anchor_sequences(args, si)
+    targets = set(_parse_station_list(args.target_stations, si, "--target-stations"))
+
+    source_row = next(
+        (row for row in source_rows if row.get("column_id") == args.source_column_id),
+        None,
+    )
+    if source_row is None:
+        raise SystemExit(f"source column not found: {args.source_column_id}")
+
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    tables = _node_tables(G, si)
+    node_off, node_stop, node_t = tables
+    run_mode = "terminal" if args.terminal_runs else args.run_mode
+    runs, _extra_edges = _run_layer_and_metric_edges(
+        G, si, node_off, run_mode, args.run_radius)
+    prob = Problem(G, runs or _NoRunLayer(), si)
+
+    source_start, source_end = _row_endpoint_nodes_from_tables(
+        node_stop, node_t, source_row)
+    src = source_start if args.source_point == "start" else source_end
+    max_elapsed_s = int(args.max_elapsed_minutes * 60)
+    max_leg_s = int(args.max_leg_minutes * 60) if args.max_leg_minutes else max_elapsed_s
+    max_end_time = int(args.max_end_time) if args.max_end_time is not None else None
+
+    seen = set()
+    for row in base_rows:
+        seen.add((
+            row["start"]["time"],
+            row["start"]["station"],
+            row["end"]["time"],
+            row["end"]["station"],
+            tuple(row.get("covered_stations", [])),
+        ))
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    generated = []
+    skipped = Counter()
+    t0 = time.time()
+
+    with out.open("w") as f:
+        for row in base_rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+
+        for sidx, sequence in enumerate(sequences, start=1):
+            nodes = [src]
+            current = src
+            elapsed_so_far = 0
+            failed = None
+            for anchor in sequence:
+                if node_off[current] == anchor:
+                    continue
+                remaining_elapsed = max_elapsed_s - elapsed_so_far
+                if remaining_elapsed <= 0:
+                    failed = (anchor, "elapsed_cap")
+                    break
+                remaining_time = None
+                if max_end_time is not None:
+                    remaining_time = max_end_time - int(node_t[current])
+                    if remaining_time < 0:
+                        failed = (anchor, "end_time_cap")
+                        break
+                max_cost = min(max_leg_s, remaining_elapsed)
+                if remaining_time is not None:
+                    max_cost = min(max_cost, remaining_time)
+                hit, prev = _dijkstra_to_station_bounded(
+                    G._adj,
+                    node_off,
+                    current,
+                    anchor,
+                    args.connector_cap,
+                    runs=runs,
+                    max_cost=max_cost,
+                )
+                if hit is None:
+                    failed = (anchor, "unreachable")
+                    break
+                seg = _path_from_prev(prev, current, hit)
+                if seg is None:
+                    failed = (anchor, "missing_path")
+                    break
+                elapsed_so_far += sum(
+                    weight for weight, _mode in _transition_series(prob, [current] + seg))
+                nodes.extend(seg)
+                current = hit
+
+            if failed is not None:
+                skipped[failed[1]] += 1
+                if args.verbose:
+                    print(f"skip sequence {sidx}: failed {failed} {sequence}", flush=True)
+                continue
+            elapsed = elapsed_so_far
+            if elapsed <= 0 or elapsed > max_elapsed_s:
+                skipped["too_long"] += 1
+                continue
+            if max_end_time is not None and int(node_t[nodes[-1]]) > max_end_time:
+                skipped["too_late"] += 1
+                continue
+            covered = {node_off[n] for n in nodes} & si.canonical_stations
+            if len(covered) < args.min_covered:
+                skipped["too_few_covered"] += 1
+                continue
+            target_hits = covered & targets if targets else set()
+            if args.min_target_hits and len(target_hits) < args.min_target_hits:
+                skipped["too_few_target_hits"] += 1
+                continue
+            key = (
+                int(node_t[nodes[0]]),
+                node_off[nodes[0]],
+                int(node_t[nodes[-1]]),
+                node_off[nodes[-1]],
+                tuple(sorted(covered)),
+            )
+            if key in seen:
+                skipped["duplicate"] += 1
+                continue
+            seen.add(key)
+            record = _column_from_nodes(
+                prob, args.label, len(base_rows) + len(generated) + 1, nodes)
+            record["pricing_anchor_sequence"] = {
+                "source_columns": args.source_columns,
+                "source_column": args.source_column_id,
+                "source_point": args.source_point,
+                "anchor_sequence": sequence,
+                "target_stations": sorted(targets),
+                "target_hits": sorted(target_hits),
+                "target_hit_count": len(target_hits),
+                "run_mode": run_mode,
+                "max_end_time": max_end_time,
+            }
+            generated.append(record)
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    print(f"anchor-sequences source={args.source_column_id} sequences={len(sequences)} "
+          f"generated={len(generated)} skipped={dict(skipped)} "
+          f"wall={time.time() - t0:.1f}s")
+    print(f"wrote {len(base_rows)} base + {len(generated)} anchor-sequence columns -> {out}")
+    return 0
+
+
+def _load_stage_groups(args, si):
+    groups = []
+    if args.stage_groups:
+        for raw_group in str(args.stage_groups).split(";"):
+            group = _parse_station_list(raw_group, si, "--stage-groups")
+            if group:
+                groups.append(group)
+    if args.stage_groups_file:
+        data = json.loads(Path(args.stage_groups_file).read_text())
+        if not isinstance(data, list):
+            raise SystemExit("--stage-groups-file must contain a JSON list")
+        for item in data:
+            if isinstance(item, str):
+                group = _parse_station_list(item, si, "--stage-groups-file")
+            elif isinstance(item, list):
+                group = [str(station) for station in item]
+                bad = [station for station in group if station not in si.canonical_stations]
+                if bad:
+                    raise SystemExit(
+                        "--stage-groups-file contains non-canonical station ids, "
+                        f"e.g. {bad[:8]}")
+            else:
+                raise SystemExit(
+                    "--stage-groups-file entries must be strings or station-id lists")
+            if group:
+                groups.append(group)
+    if not groups:
+        raise SystemExit("provide --stage-groups or --stage-groups-file")
+    unique_groups = []
+    for group in groups:
+        seen = set()
+        unique_groups.append([
+            station for station in group if not (station in seen or seen.add(station))
+        ])
+    return unique_groups
+
+
+def _parse_stage_min_hits(value, stage_count):
+    if value is None:
+        return [1] * stage_count
+    values = [
+        int(part.strip())
+        for part in str(value).split(",")
+        if part.strip()
+    ]
+    if not values:
+        return [1] * stage_count
+    if len(values) == 1:
+        return values * stage_count
+    if len(values) != stage_count:
+        raise SystemExit(
+            f"--stage-min-hits must contain one value or {stage_count} values")
+    if any(value < 0 for value in values):
+        raise SystemExit("--stage-min-hits values must be non-negative")
+    return values
+
+
+def _load_resource_groups(args, si):
+    groups = []
+
+    def add_group(name, raw_stations, source):
+        if isinstance(raw_stations, str):
+            stations = _parse_station_list(raw_stations, si, source)
+        elif isinstance(raw_stations, list):
+            stations = [str(station) for station in raw_stations]
+            bad = [station for station in stations if station not in si.canonical_stations]
+            if bad:
+                raise SystemExit(
+                    f"{source} contains non-canonical station ids, e.g. {bad[:8]}")
+        else:
+            raise SystemExit(f"{source} station group must be a string or list")
+        seen = set()
+        stations = [
+            station for station in stations
+            if not (station in seen or seen.add(station))
+        ]
+        if not stations:
+            return
+        groups.append({
+            "name": str(name or f"resource{len(groups) + 1}"),
+            "stations": stations,
+        })
+
+    if args.resource_groups:
+        for raw_group in str(args.resource_groups).split(";"):
+            raw_group = raw_group.strip()
+            if not raw_group:
+                continue
+            if ":" in raw_group:
+                name, raw_stations = raw_group.split(":", 1)
+            elif "=" in raw_group:
+                name, raw_stations = raw_group.split("=", 1)
+            else:
+                name, raw_stations = f"resource{len(groups) + 1}", raw_group
+            add_group(name.strip(), raw_stations, "--resource-groups")
+
+    if args.resource_groups_file:
+        data = json.loads(Path(args.resource_groups_file).read_text())
+        if isinstance(data, dict):
+            iterable = data.items()
+        elif isinstance(data, list):
+            iterable = []
+            for item in data:
+                if isinstance(item, dict):
+                    name = item.get("name", f"resource{len(groups) + len(iterable) + 1}")
+                    stations = item.get("stations", item.get("group"))
+                    iterable.append((name, stations))
+                elif isinstance(item, str):
+                    if ":" in item:
+                        name, stations = item.split(":", 1)
+                    elif "=" in item:
+                        name, stations = item.split("=", 1)
+                    else:
+                        name, stations = (
+                            f"resource{len(groups) + len(iterable) + 1}",
+                            item,
+                        )
+                    iterable.append((name, stations))
+                else:
+                    raise SystemExit(
+                        "--resource-groups-file list entries must be objects or strings")
+        else:
+            raise SystemExit("--resource-groups-file must contain a JSON object or list")
+        for name, stations in iterable:
+            add_group(name, stations, "--resource-groups-file")
+
+    if not groups:
+        raise SystemExit("provide --resource-groups or --resource-groups-file")
+
+    seen_names = Counter(group["name"] for group in groups)
+    if any(count > 1 for count in seen_names.values()):
+        renamed = []
+        used = Counter()
+        for group in groups:
+            used[group["name"]] += 1
+            if seen_names[group["name"]] == 1:
+                renamed.append(group)
+            else:
+                renamed.append({
+                    **group,
+                    "name": f"{group['name']}_{used[group['name']]}",
+                })
+        groups = renamed
+    return groups
+
+
+def _parse_resource_min_hits(value, resource_count):
+    if value is None:
+        return [1] * resource_count
+    values = [
+        int(part.strip())
+        for part in str(value).split(",")
+        if part.strip()
+    ]
+    if not values:
+        return [1] * resource_count
+    if len(values) == 1:
+        values = values * resource_count
+    if len(values) != resource_count:
+        raise SystemExit(
+            f"--resource-min-hits must contain one value or {resource_count} values")
+    if any(value < 0 for value in values):
+        raise SystemExit("--resource-min-hits values must be non-negative")
+    return values
+
+
+def cmd_price_resource_chains(args) -> int:
+    import pickle
+
+    base_rows = _load_column_rows(Path(args.base_columns)) if args.base_columns else []
+    source_rows = _load_column_rows(Path(args.source_columns))
+
+    si = StationIndex.load()
+    resources = _load_resource_groups(args, si)
+    resource_min_hits = _parse_resource_min_hits(
+        args.resource_min_hits,
+        len(resources),
+    )
+    resource_sets = [set(resource["stations"]) for resource in resources]
+    resource_targets = {station for group in resource_sets for station in group}
+    targets = set(resource_targets)
+    if args.target_stations or args.targets_file:
+        targets.update(_load_target_stations(args, si))
+    target_order = []
+    for resource in resources:
+        for station in resource["stations"]:
+            if station not in target_order:
+                target_order.append(station)
+    for station in _parse_station_list(args.target_stations, si, "--target-stations"):
+        if station not in target_order:
+            target_order.append(station)
+    for station in sorted(targets):
+        if station not in target_order:
+            target_order.append(station)
+    target_order_index = {
+        station: idx
+        for idx, station in enumerate(target_order)
+    }
+
+    finals = _parse_station_list(args.final_stations, si, "--final-stations")
+    if not finals:
+        raise SystemExit("--final-stations must include at least one canonical station")
+    min_resource_count = int(args.min_resource_count)
+    if min_resource_count < 0 or min_resource_count > len(resources):
+        raise SystemExit("--min-resource-count must be between 0 and the resource count")
+    frontier_min_resource_count = (
+        min_resource_count
+        if args.frontier_min_resource_count is None
+        else int(args.frontier_min_resource_count)
+    )
+    if frontier_min_resource_count < 0 or frontier_min_resource_count > len(resources):
+        raise SystemExit(
+            "--frontier-min-resource-count must be between 0 and the resource count")
+    frontier_min_target_hits = (
+        int(args.min_target_hits)
+        if args.frontier_min_target_hits is None
+        else int(args.frontier_min_target_hits)
+    )
+    frontier_min_covered = (
+        int(args.min_covered)
+        if args.frontier_min_covered is None
+        else int(args.frontier_min_covered)
+    )
+    resource_name_to_index = {resource["name"]: idx for idx, resource in enumerate(resources)}
+    required_resource_names = [
+        name.strip()
+        for name in str(args.require_resources or "").split(",")
+        if name.strip()
+    ]
+    missing_required_resources = [
+        name for name in required_resource_names if name not in resource_name_to_index
+    ]
+    if missing_required_resources:
+        raise SystemExit(
+            "--require-resources contains unknown names, "
+            f"e.g. {missing_required_resources[:8]}")
+    required_resource_mask = 0
+    for name in required_resource_names:
+        required_resource_mask |= 1 << resource_name_to_index[name]
+
+    source_row = next(
+        (row for row in source_rows if row.get("column_id") == args.source_column_id),
+        None,
+    )
+    if source_row is None:
+        raise SystemExit(f"source column not found: {args.source_column_id}")
+
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    tables = _node_tables(G, si)
+    node_off, node_stop, node_t = tables
+    run_mode = "terminal" if args.terminal_runs else args.run_mode
+    runs, _extra_edges = _run_layer_and_metric_edges(
+        G, si, node_off, run_mode, args.run_radius)
+    prob = Problem(G, runs or _NoRunLayer(), si)
+
+    source_start, source_end = _row_endpoint_nodes_from_tables(
+        node_stop, node_t, source_row)
+    src = source_start if args.source_point == "start" else source_end
+    max_end_time = int(args.max_end_time) if args.max_end_time is not None else None
+    if max_end_time is not None and int(node_t[src]) > max_end_time:
+        raise SystemExit("source starts after --max-end-time")
+    max_elapsed_s = int(args.max_elapsed_minutes * 60)
+    max_leg_s = int(args.max_leg_minutes * 60) if args.max_leg_minutes else max_elapsed_s
+    max_score = INF if args.max_score_s is None else float(args.max_score_s)
+    time_bucket_s = max(1, int(args.time_bucket_s))
+    max_expand_targets = max(0, int(args.max_expand_targets))
+
+    leg_cache = {}
+    final_cache = {}
+    persistent_cache = {}
+    persistent_cache_new = []
+    persistent_cache_hits = 0
+    persistent_cache_misses = 0
+    persistent_cache_path = (
+        None
+        if args.no_resource_chain_cache
+        else Path(args.resource_chain_cache)
+    )
+    if persistent_cache_path is not None and persistent_cache_path.exists():
+        with persistent_cache_path.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = tuple(item.get("key", []))
+                if not key:
+                    continue
+                if item.get("reachable"):
+                    persistent_cache[key] = (
+                        int(item["hit"]),
+                        [int(node) for node in item.get("seg", [])],
+                    )
+                else:
+                    persistent_cache[key] = None
+    t0 = time.time()
+    persistent_cache_written = 0
+
+    def flush_persistent_cache():
+        nonlocal persistent_cache_new, persistent_cache_written
+        if persistent_cache_path is None or not persistent_cache_new:
+            return
+        persistent_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with persistent_cache_path.open("a") as f:
+            for item in persistent_cache_new:
+                f.write(json.dumps(item, sort_keys=True) + "\n")
+        persistent_cache_written += len(persistent_cache_new)
+        persistent_cache_new = []
+
+    def cached_to_station(cur, station, cap_s, cache):
+        nonlocal persistent_cache_hits, persistent_cache_misses
+        key = (cur, station, int(cap_s))
+        if key not in cache:
+            nonlocal_key = (
+                int(cur),
+                str(station),
+                int(cap_s),
+                run_mode,
+                int(round(float(args.run_radius))),
+                int(args.connector_cap),
+            )
+            if persistent_cache_path is not None and nonlocal_key in persistent_cache:
+                persistent_cache_hits += 1
+                cache[key] = persistent_cache[nonlocal_key]
+                return cache[key]
+            if persistent_cache_path is not None:
+                persistent_cache_misses += 1
+            hit, prev = _dijkstra_to_station_bounded(
+                G._adj,
+                node_off,
+                cur,
+                station,
+                args.connector_cap,
+                runs=runs,
+                max_cost=cap_s,
+            )
+            if hit is None:
+                cache[key] = None
+                if persistent_cache_path is not None:
+                    persistent_cache[nonlocal_key] = None
+                    persistent_cache_new.append({
+                        "key": list(nonlocal_key),
+                        "reachable": False,
+                    })
+            else:
+                seg = _path_from_prev(prev, cur, hit)
+                cache[key] = (hit, seg)
+                if persistent_cache_path is not None:
+                    persistent_cache[nonlocal_key] = (int(hit), [int(node) for node in seg])
+                    persistent_cache_new.append({
+                        "key": list(nonlocal_key),
+                        "reachable": True,
+                        "hit": int(hit),
+                        "seg": [int(node) for node in seg],
+                    })
+            if len(persistent_cache_new) >= 1000:
+                flush_persistent_cache()
+        return cache[key]
+
+    def resource_hits_for(covered):
+        return tuple(frozenset(covered & group) for group in resource_sets)
+
+    def resource_mask_for(resource_hits):
+        mask = 0
+        for idx, hits in enumerate(resource_hits):
+            if len(hits) >= resource_min_hits[idx]:
+                mask |= 1 << idx
+        return mask
+
+    def score_state(state):
+        resource_hit_total = sum(len(hits) for hits in state["resource_hits"])
+        return (
+            int(state["elapsed_s"])
+            + int(args.column_penalty)
+            - float(args.target_reward_s) * len(state["hits"])
+            - float(args.cover_reward_s) * len(state["covered"])
+            - float(args.resource_reward_s) * int(state["resource_mask"].bit_count())
+            - float(args.resource_hit_reward_s) * resource_hit_total
+        )
+
+    def extend_to_station(state, station, cache):
+        cur = state["current"]
+        remaining_elapsed = max_elapsed_s - int(state["elapsed_s"])
+        if remaining_elapsed < 0:
+            return None
+        if max_end_time is None:
+            remaining_time = remaining_elapsed
+        else:
+            remaining_time = max_end_time - int(node_t[cur])
+            if remaining_time < 0:
+                return None
+        cap_s = min(max_leg_s, remaining_elapsed, remaining_time)
+        if node_off[cur] == station:
+            hit = cur
+            seg = []
+        else:
+            cached = cached_to_station(cur, station, cap_s, cache)
+            if cached is None:
+                return None
+            hit, seg = cached
+            if seg is None:
+                return None
+        if max_end_time is not None and int(node_t[hit]) > max_end_time:
+            return None
+        nodes = state["nodes"] + tuple(seg)
+        add_elapsed = (
+            sum(weight for weight, _mode in _transition_series(prob, [cur] + list(seg)))
+            if seg else 0
+        )
+        elapsed = int(state["elapsed_s"]) + int(add_elapsed)
+        if elapsed > max_elapsed_s:
+            return None
+        covered = set(state["covered"])
+        covered.update(node_off[n] for n in seg if node_off[n] in si.canonical_stations)
+        covered.add(node_off[hit])
+        resource_hits = resource_hits_for(covered)
+        resource_mask = resource_mask_for(resource_hits)
+        return {
+            "nodes": nodes,
+            "current": hit,
+            "covered": frozenset(covered),
+            "hits": frozenset(covered & targets),
+            "resource_hits": resource_hits,
+            "resource_mask": resource_mask,
+            "anchors": state["anchors"] + (station,),
+            "elapsed_s": elapsed,
+        }
+
+    def expansion_targets(state):
+        candidates = []
+        for station in target_order:
+            if station in state["hits"]:
+                continue
+            resource_need = 0
+            for idx, group in enumerate(resource_sets):
+                if station not in group or station in state["covered"]:
+                    continue
+                if state["resource_mask"] & (1 << idx):
+                    continue
+                resource_need += 1
+            candidates.append((
+                -resource_need,
+                target_order_index.get(station, len(target_order_index)),
+                station,
+            ))
+        candidates.sort()
+        stations = [station for _priority, _order, station in candidates]
+        if max_expand_targets:
+            stations = stations[:max_expand_targets]
+        return stations
+
+    initial_covered = {node_off[src]} & si.canonical_stations
+    initial_resource_hits = resource_hits_for(initial_covered)
+    beam = [{
+        "nodes": (src,),
+        "current": src,
+        "covered": frozenset(initial_covered),
+        "hits": frozenset(initial_covered & targets),
+        "resource_hits": initial_resource_hits,
+        "resource_mask": resource_mask_for(initial_resource_hits),
+        "anchors": (),
+        "elapsed_s": 0,
+    }]
+    best_by_key = {}
+    final_candidates = []
+    seen_final = set()
+    frontier_pool = {}
+
+    def record_frontier_state(state):
+        if not args.emit_frontier_top:
+            return
+        if (state["resource_mask"] & required_resource_mask) != required_resource_mask:
+            return
+        if int(state["resource_mask"].bit_count()) < frontier_min_resource_count:
+            return
+        if len(state["hits"]) < frontier_min_target_hits:
+            return
+        if len(state["covered"]) < frontier_min_covered:
+            return
+        nodes = state["nodes"]
+        key = (
+            int(node_t[nodes[0]]),
+            node_off[nodes[0]],
+            int(node_t[nodes[-1]]),
+            node_off[nodes[-1]],
+            tuple(sorted(state["covered"])),
+            tuple(sorted(state["hits"])),
+            state["resource_mask"],
+        )
+        candidate = {
+            **state,
+            "final_station": None,
+            "score_s": float(score_state(state)),
+            "resource_chain_frontier": True,
+        }
+        old = frontier_pool.get(key)
+        if old is None or candidate["score_s"] < old["score_s"]:
+            frontier_pool[key] = candidate
+
+    def add_final_candidate(state, final_station):
+        final_state = extend_to_station(state, final_station, final_cache)
+        if final_state is None:
+            return
+        if (final_state["resource_mask"] & required_resource_mask) != required_resource_mask:
+            return
+        if int(final_state["resource_mask"].bit_count()) < min_resource_count:
+            return
+        if len(final_state["hits"]) < args.min_target_hits:
+            return
+        if len(final_state["covered"]) < args.min_covered:
+            return
+        score = score_state(final_state)
+        if max_score < INF and score > max_score:
+            return
+        nodes = final_state["nodes"]
+        key = (
+            int(node_t[nodes[0]]),
+            node_off[nodes[0]],
+            int(node_t[nodes[-1]]),
+            node_off[nodes[-1]],
+            tuple(sorted(final_state["covered"])),
+            tuple(sorted(final_state["hits"])),
+            final_state["resource_mask"],
+        )
+        if key in seen_final:
+            return
+        seen_final.add(key)
+        final_candidates.append({
+            **final_state,
+            "final_station": final_station,
+            "score_s": float(score),
+        })
+
+    for depth in range(args.max_depth + 1):
+        for state in beam:
+            record_frontier_state(state)
+            if not args.frontier_only:
+                for final_station in finals:
+                    add_final_candidate(state, final_station)
+        if depth == args.max_depth:
+            break
+
+        expansion_jobs = []
+        for state_index, state in enumerate(beam):
+            for station in expansion_targets(state):
+                expansion_jobs.append((
+                    score_state(state),
+                    state["elapsed_s"],
+                    int(node_t[state["current"]]),
+                    state_index,
+                    station,
+                    state,
+                ))
+        expansion_jobs.sort(key=lambda item: item[:5])
+        skipped_expansions = 0
+        if args.max_expansions_per_depth and len(expansion_jobs) > args.max_expansions_per_depth:
+            skipped_expansions = len(expansion_jobs) - int(args.max_expansions_per_depth)
+            expansion_jobs = expansion_jobs[:int(args.max_expansions_per_depth)]
+
+        next_states = []
+        for _score, _elapsed, _time, _state_index, station, state in expansion_jobs:
+            extended = extend_to_station(state, station, leg_cache)
+            if extended is None:
+                continue
+            if (
+                len(extended["hits"]) <= len(state["hits"])
+                and extended["resource_mask"] == state["resource_mask"]
+            ):
+                continue
+            key = (
+                extended["current"],
+                extended["resource_mask"],
+                extended["hits"],
+                int(extended["elapsed_s"] // time_bucket_s),
+            )
+            old = best_by_key.get(key)
+            if old is not None and score_state(old) <= score_state(extended):
+                continue
+            best_by_key[key] = extended
+            next_states.append(extended)
+
+        dedup = {}
+        for state in next_states:
+            key = (
+                state["current"],
+                state["resource_mask"],
+                state["hits"],
+                int(state["elapsed_s"] // time_bucket_s),
+            )
+            old = dedup.get(key)
+            if old is None or score_state(state) < score_state(old):
+                dedup[key] = state
+        beam = sorted(
+            dedup.values(),
+            key=lambda state: (
+                score_state(state),
+                -int(state["resource_mask"].bit_count()),
+                -len(state["hits"]),
+                -len(state["covered"]),
+                state["elapsed_s"],
+                int(node_t[state["current"]]),
+                state["anchors"],
+            ),
+        )[:args.beam_size]
+        mask_counts = Counter(state["resource_mask"] for state in beam)
+        print(f"resource-chain depth={depth + 1} states={len(beam)} "
+              f"finals={len(final_candidates)} masks={len(mask_counts)} "
+              f"expansions={len(expansion_jobs)} skipped={skipped_expansions} "
+              f"leg_cache={len(leg_cache)} wall={time.time() - t0:.1f}s",
+              flush=True)
+        flush_persistent_cache()
+        if not beam:
+            break
+
+    final_candidates.sort(
+        key=lambda state: (
+            state["score_s"],
+            -int(state["resource_mask"].bit_count()),
+            -len(state["hits"]),
+            -len(state["covered"]),
+            state["elapsed_s"],
+            int(node_t[state["nodes"][-1]]),
+            state["anchors"],
+        )
+    )
+    if args.emit_top:
+        final_candidates = final_candidates[:args.emit_top]
+    if args.max_generated:
+        final_candidates = final_candidates[:args.max_generated]
+
+    frontier_candidates = []
+    if args.emit_frontier_top:
+        frontier_candidates = list(frontier_pool.values())
+        frontier_candidates.sort(
+            key=lambda state: (
+                state["score_s"],
+                -int(state["resource_mask"].bit_count()),
+                -len(state["hits"]),
+                -len(state["covered"]),
+                state["elapsed_s"],
+                int(node_t[state["nodes"][-1]]),
+                state["anchors"],
+            )
+        )
+        frontier_candidates = frontier_candidates[:int(args.emit_frontier_top)]
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    generated = []
+    seen_base = set()
+    for row in base_rows:
+        seen_base.add((
+            row["start"]["time"],
+            row["start"]["station"],
+            row["end"]["time"],
+            row["end"]["station"],
+            tuple(row.get("covered_stations", [])),
+        ))
+
+    with out.open("w") as f:
+        for row in base_rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+        for state in list(final_candidates) + frontier_candidates:
+            nodes = state["nodes"]
+            key = (
+                int(node_t[nodes[0]]),
+                node_off[nodes[0]],
+                int(node_t[nodes[-1]]),
+                node_off[nodes[-1]],
+                tuple(sorted(state["covered"])),
+            )
+            if key in seen_base:
+                continue
+            seen_base.add(key)
+            record = _column_from_nodes(
+                prob, args.label, len(base_rows) + len(generated) + 1, nodes)
+            record["pricing_resource_chain"] = {
+                "source_columns": args.source_columns,
+                "source_column": args.source_column_id,
+                "source_point": args.source_point,
+                "resources": [
+                    {
+                        "name": resource["name"],
+                        "stations": resource["stations"],
+                        "min_hits": resource_min_hits[idx],
+                        "hits": sorted(state["resource_hits"][idx]),
+                    }
+                    for idx, resource in enumerate(resources)
+                ],
+                "resource_mask": int(state["resource_mask"]),
+                "resource_count": int(state["resource_mask"].bit_count()),
+                "required_resources": required_resource_names,
+                "anchors": list(state["anchors"]),
+                "final_station": state["final_station"],
+                "frontier": bool(state.get("resource_chain_frontier", False)),
+                "target_stations": sorted(targets),
+                "target_hits": sorted(state["hits"]),
+                "target_hit_count": len(state["hits"]),
+                "score_s": state["score_s"],
+                "max_end_time": max_end_time,
+                "run_mode": run_mode,
+            }
+            generated.append(record)
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    flush_persistent_cache()
+
+    print(f"resource-chain source={args.source_column_id} resources={len(resources)} "
+          f"final_candidates={len(final_candidates)} "
+          f"frontier_candidates={len(frontier_candidates)} "
+          f"generated={len(generated)} "
+          f"leg_cache={len(leg_cache)} final_cache={len(final_cache)} "
+          f"persistent_cache_hits={persistent_cache_hits} "
+          f"persistent_cache_misses={persistent_cache_misses} "
+          f"persistent_cache_new={len(persistent_cache_new)} "
+          f"persistent_cache_written={persistent_cache_written} "
+          f"wall={time.time() - t0:.1f}s")
+    if persistent_cache_path is not None:
+        print(f"resource-chain cache path={persistent_cache_path}")
+    print(f"wrote {len(base_rows)} base + {len(generated)} resource-chain columns -> {out}")
+    return 0
+
+
+def cmd_price_stage_chains(args) -> int:
+    import pickle
+
+    base_rows = _load_column_rows(Path(args.base_columns)) if args.base_columns else []
+    source_rows = _load_column_rows(Path(args.source_columns))
+
+    si = StationIndex.load()
+    stage_groups = _load_stage_groups(args, si)
+    stage_min_hits = _parse_stage_min_hits(args.stage_min_hits, len(stage_groups))
+    staged_targets = {station for group in stage_groups for station in group}
+    targets = set(staged_targets)
+    if args.target_stations or args.targets_file:
+        targets.update(_load_target_stations(args, si))
+    finals = _parse_station_list(args.final_stations, si, "--final-stations")
+    if not finals:
+        raise SystemExit("--final-stations must include at least one canonical station")
+
+    source_row = next(
+        (row for row in source_rows if row.get("column_id") == args.source_column_id),
+        None,
+    )
+    if source_row is None:
+        raise SystemExit(f"source column not found: {args.source_column_id}")
+
+    with open(GRAPH_PKL, "rb") as f:
+        G = pickle.load(f)
+    tables = _node_tables(G, si)
+    node_off, node_stop, node_t = tables
+    run_mode = "terminal" if args.terminal_runs else args.run_mode
+    runs, _extra_edges = _run_layer_and_metric_edges(
+        G, si, node_off, run_mode, args.run_radius)
+    prob = Problem(G, runs or _NoRunLayer(), si)
+
+    source_start, source_end = _row_endpoint_nodes_from_tables(
+        node_stop, node_t, source_row)
+    src = source_start if args.source_point == "start" else source_end
+    max_end_time = int(args.max_end_time) if args.max_end_time is not None else None
+    if max_end_time is not None and int(node_t[src]) > max_end_time:
+        raise SystemExit("source starts after --max-end-time")
+    max_elapsed_s = int(args.max_elapsed_minutes * 60)
+    max_leg_s = int(args.max_leg_minutes * 60) if args.max_leg_minutes else max_elapsed_s
+    max_score = INF if args.max_score_s is None else float(args.max_score_s)
+    time_bucket_s = max(1, int(args.time_bucket_s))
+
+    leg_cache = {}
+
+    def cached_to_station(cur, station, cap_s):
+        key = (cur, station, int(cap_s))
+        if key not in leg_cache:
+            hit, prev = _dijkstra_to_station_bounded(
+                G._adj,
+                node_off,
+                cur,
+                station,
+                args.connector_cap,
+                runs=runs,
+                max_cost=cap_s,
+            )
+            if hit is None:
+                leg_cache[key] = None
+            else:
+                leg_cache[key] = (hit, _path_from_prev(prev, cur, hit))
+        return leg_cache[key]
+
+    def score_state(state):
+        return (
+            state["elapsed_s"]
+            + args.column_penalty
+            - args.target_reward_s * len(state["hits"])
+            - args.cover_reward_s * len(state["covered"])
+            - args.stage_reward_s * len(state["stage_hits"])
+        )
+
+    def extend_to_station(state, station, stage_index, anchor_prefix, record_stage=True):
+        cur = state["current"]
+        remaining_elapsed = max_elapsed_s - int(state["elapsed_s"])
+        if remaining_elapsed < 0:
+            return None
+        if max_end_time is None:
+            remaining_time = remaining_elapsed
+        else:
+            remaining_time = max_end_time - int(node_t[cur])
+            if remaining_time < 0:
+                return None
+        cap_s = min(max_leg_s, remaining_elapsed, remaining_time)
+        if node_off[cur] == station:
+            hit = cur
+            seg = ()
+        else:
+            cached = cached_to_station(cur, station, cap_s)
+            if cached is None:
+                return None
+            hit, seg = cached
+            if seg is None:
+                return None
+        if max_end_time is not None and int(node_t[hit]) > max_end_time:
+            return None
+        add_elapsed = _elapsed(node_t[cur], node_t[hit])
+        elapsed = int(state["elapsed_s"]) + int(add_elapsed)
+        if elapsed > max_elapsed_s:
+            return None
+        covered = set(state["covered"])
+        covered.update(node_off[n] for n in seg if node_off[n] in si.canonical_stations)
+        covered.add(node_off[hit])
+        hits = frozenset(covered & targets)
+        stage_hits = (
+            tuple(list(state["stage_hits"]) + [station])
+            if record_stage else state["stage_hits"]
+        )
+        return {
+            "nodes": state["nodes"] + tuple(seg),
+            "current": hit,
+            "covered": frozenset(covered),
+            "hits": hits,
+            "stage_hits": stage_hits,
+            "anchors": state["anchors"] + (f"{anchor_prefix}:{station}",),
+            "elapsed_s": int(elapsed),
+        }
+
+    initial_covered = {node_off[src]} & si.canonical_stations
+    beam = [{
+        "nodes": (src,),
+        "current": src,
+        "covered": frozenset(initial_covered),
+        "hits": frozenset(initial_covered & targets),
+        "stage_hits": (),
+        "anchors": (),
+        "elapsed_s": 0,
+    }]
+    t0 = time.time()
+    frontier_pool = {}
+
+    def record_frontier_state(state, stage_index):
+        if not args.emit_frontier_top:
+            return
+        if len(state["hits"]) < args.frontier_min_target_hits:
+            return
+        if len(state["covered"]) < args.frontier_min_covered:
+            return
+        nodes = state["nodes"]
+        key = (
+            int(node_t[nodes[0]]),
+            node_off[nodes[0]],
+            int(node_t[nodes[-1]]),
+            node_off[nodes[-1]],
+            tuple(sorted(state["covered"])),
+            tuple(sorted(state["hits"])),
+            state["anchors"],
+            int(stage_index),
+        )
+        candidate = {
+            **state,
+            "final_station": None,
+            "score_s": score_state(state),
+            "stage_chain_frontier": True,
+            "frontier_stage_index": int(stage_index),
+        }
+        old = frontier_pool.get(key)
+        if old is None or candidate["score_s"] < old["score_s"]:
+            frontier_pool[key] = candidate
+
+    def mark_stage_satisfied(state, stage_index, stage_set, required_hits):
+        if required_hits <= 0:
+            chosen = []
+        else:
+            chosen = sorted(state["covered"] & stage_set)[:required_hits]
+        old_hits = list(state["stage_hits"])
+        old_set = set(old_hits)
+        additions = [station for station in chosen if station not in old_set]
+        marker = ",".join(chosen) if chosen else "none"
+        return {
+            **state,
+            "stage_hits": tuple(old_hits + additions),
+            "anchors": state["anchors"] + (f"stage{stage_index}:covered:{marker}",),
+        }
+
+    for stage_index, group in enumerate(stage_groups, start=1):
+        stage_set = set(group)
+        required_hits = min(int(stage_min_hits[stage_index - 1]), len(stage_set))
+        stage_targets = group[:args.max_stage_targets] if args.max_stage_targets else group
+        max_stage_depth = (
+            int(args.max_stage_depth)
+            if args.max_stage_depth
+            else max(1, required_hits)
+        )
+        stage_frontier = beam
+        satisfied = []
+        for depth in range(max_stage_depth + 1):
+            next_frontier = []
+            for state in stage_frontier:
+                covered_in_stage = state["covered"] & stage_set
+                if (
+                    len(covered_in_stage) >= required_hits
+                    and (not args.force_stage_move or depth > 0)
+                ):
+                    satisfied.append(
+                        mark_stage_satisfied(
+                            state,
+                            stage_index,
+                            stage_set,
+                            required_hits,
+                        )
+                    )
+                if depth >= max_stage_depth:
+                    continue
+                for station in stage_targets:
+                    if station in covered_in_stage:
+                        continue
+                    extended = extend_to_station(
+                        state, station, stage_index, f"stage{stage_index}")
+                    if extended is not None:
+                        next_frontier.append(extended)
+            dedup = {}
+            for state in next_frontier:
+                key = (
+                    state["current"],
+                    state["hits"],
+                    int(state["elapsed_s"] // time_bucket_s),
+                    len(state["covered"] & stage_set),
+                )
+                old = dedup.get(key)
+                if old is None or score_state(state) < score_state(old):
+                    dedup[key] = state
+            stage_frontier = sorted(
+                dedup.values(),
+                key=lambda state: (
+                    score_state(state),
+                    -len(state["hits"]),
+                    -len(state["covered"] & stage_set),
+                    state["elapsed_s"],
+                    int(node_t[state["current"]]),
+                    state["anchors"],
+                ),
+            )[:args.beam_size]
+            if not stage_frontier:
+                break
+
+        dedup = {}
+        for state in satisfied:
+            key = (
+                state["current"],
+                state["hits"],
+                int(state["elapsed_s"] // time_bucket_s),
+                tuple(sorted(state["covered"] & stage_set)),
+            )
+            old = dedup.get(key)
+            if old is None or score_state(state) < score_state(old):
+                dedup[key] = state
+        beam = sorted(
+            dedup.values(),
+            key=lambda state: (
+                score_state(state),
+                -len(state["hits"]),
+                -len(state["covered"] & stage_set),
+                state["elapsed_s"],
+                int(node_t[state["current"]]),
+                state["anchors"],
+            ),
+        )[:args.beam_size]
+        print(f"stage-chain stage={stage_index}/{len(stage_groups)} "
+              f"min_hits={required_hits} states={len(beam)} "
+              f"leg_cache={len(leg_cache)} "
+              f"wall={time.time() - t0:.1f}s", flush=True)
+        for state in beam:
+            record_frontier_state(state, stage_index)
+        if not beam:
+            break
+
+    final_candidates = []
+    seen_final = set()
+    if not args.frontier_only:
+        for state in beam:
+            for final_station in finals:
+                final_state = extend_to_station(
+                    state,
+                    final_station,
+                    len(stage_groups) + 1,
+                    "final",
+                    record_stage=False,
+                )
+                if final_state is None:
+                    continue
+                if len(final_state["hits"]) < args.min_target_hits:
+                    continue
+                if len(final_state["covered"]) < args.min_covered:
+                    continue
+                score = score_state(final_state)
+                if max_score < INF and score > max_score:
+                    continue
+                key = (
+                    int(node_t[final_state["nodes"][0]]),
+                    node_off[final_state["nodes"][0]],
+                    int(node_t[final_state["nodes"][-1]]),
+                    node_off[final_state["nodes"][-1]],
+                    tuple(sorted(final_state["covered"])),
+                    tuple(sorted(final_state["hits"])),
+                    final_state["anchors"],
+                )
+                if key in seen_final:
+                    continue
+                seen_final.add(key)
+                final_candidates.append({
+                    **final_state,
+                    "final_station": final_station,
+                    "score_s": score,
+                    "stage_chain_frontier": False,
+                    "frontier_stage_index": None,
+                })
+
+    frontier_candidates = []
+    if args.emit_frontier_top:
+        frontier_candidates = list(frontier_pool.values())
+        frontier_candidates.sort(
+            key=lambda state: (
+                state["score_s"],
+                -len(state["hits"]),
+                -len(state["covered"]),
+                state["elapsed_s"],
+                int(node_t[state["nodes"][-1]]),
+                state["anchors"],
+            )
+        )
+        frontier_candidates = frontier_candidates[:int(args.emit_frontier_top)]
+
+    final_candidates.sort(
+        key=lambda state: (
+            state["score_s"],
+            -len(state["hits"]),
+            -len(state["covered"]),
+            state["elapsed_s"],
+            int(node_t[state["nodes"][-1]]),
+            state["anchors"],
+        )
+    )
+    if args.emit_top:
+        final_candidates = final_candidates[:args.emit_top]
+    if args.max_generated:
+        final_candidates = final_candidates[:args.max_generated]
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    generated = []
+    seen_base = set()
+    for row in base_rows:
+        seen_base.add((
+            row["start"]["time"],
+            row["start"]["station"],
+            row["end"]["time"],
+            row["end"]["station"],
+            tuple(row.get("covered_stations", [])),
+        ))
+
+    with out.open("w") as f:
+        for row in base_rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+        for state in list(final_candidates) + frontier_candidates:
+            nodes = state["nodes"]
+            key = (
+                int(node_t[nodes[0]]),
+                node_off[nodes[0]],
+                int(node_t[nodes[-1]]),
+                node_off[nodes[-1]],
+                tuple(sorted(state["covered"])),
+            )
+            if key in seen_base:
+                continue
+            seen_base.add(key)
+            record = _column_from_nodes(
+                prob, args.label, len(base_rows) + len(generated) + 1, nodes)
+            record["pricing_stage_chain"] = {
+                "source_columns": args.source_columns,
+                "source_column": args.source_column_id,
+                "source_point": args.source_point,
+                "stage_groups": stage_groups,
+                "stage_min_hits": stage_min_hits,
+                "stage_hits": list(state["stage_hits"]),
+                "anchors": list(state["anchors"]),
+                "final_station": state["final_station"],
+                "frontier": bool(state.get("stage_chain_frontier", False)),
+                "frontier_stage_index": state.get("frontier_stage_index"),
+                "target_stations": sorted(targets),
+                "target_hits": sorted(state["hits"]),
+                "target_hit_count": len(state["hits"]),
+                "score_s": state["score_s"],
+                "max_end_time": max_end_time,
+                "run_mode": run_mode,
+            }
+            generated.append(record)
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    print(f"stage-chain source={args.source_column_id} stages={len(stage_groups)} "
+          f"final_candidates={len(final_candidates)} "
+          f"frontier_candidates={len(frontier_candidates)} "
+          f"generated={len(generated)} "
+          f"leg_cache={len(leg_cache)} wall={time.time() - t0:.1f}s")
+    print(f"wrote {len(base_rows)} base + {len(generated)} stage-chain columns -> {out}")
+    return 0
+
+
 def _state_score(state, target_reward_s, cover_reward_s):
     return (
         target_reward_s * len(state["hits"])
@@ -3295,13 +6453,13 @@ def cmd_price_late_tail_beam(args) -> int:
         G = pickle.load(f)
     tables = _node_tables(G, si)
     node_off, node_stop, node_t = tables
-    stop_events = _stop_index(node_stop, node_t)
     run_mode = "terminal" if args.terminal_runs else args.run_mode
     runs, _extra_edges = _run_layer_and_metric_edges(
         G, si, node_off, run_mode, args.run_radius)
-    prob = Problem(G, RunLayer.from_graph(G, radius_m=args.validation_radius), si)
+    prob = Problem(G, runs or _NoRunLayer(), si)
 
-    source_start, source_end = _row_endpoint_nodes(stop_events, node_t, source_row)
+    source_start, source_end = _row_endpoint_nodes_from_tables(
+        node_stop, node_t, source_row)
     src = source_start if args.source_point == "start" else source_end
     if node_t[src] > args.max_end_time:
         raise SystemExit("source starts after --max-end-time")
@@ -3551,10 +6709,20 @@ def cmd_split_columns(args) -> int:
         raise SystemExit("--split-stations must include at least one canonical station")
     split_set = set(split_stations)
     base_rows = _load_column_rows(Path(args.base_columns)) if args.base_columns else []
+    column_id_prefixes = [
+        prefix.strip()
+        for prefix in str(args.column_id_prefix or "").split(",")
+        if prefix.strip()
+    ]
     source_rows = []
     for source_file in args.source_columns:
         for row in _load_column_rows(Path(source_file)):
             if args.pricing_kind and args.pricing_kind not in row:
+                continue
+            if column_id_prefixes and not any(
+                str(row.get("column_id", "")).startswith(prefix)
+                for prefix in column_id_prefixes
+            ):
                 continue
             source_rows.append((source_file, row))
 
@@ -4012,29 +7180,265 @@ def main(argv=None) -> int:
     ec.add_argument("--force-solution-arcs", nargs="*", default=[],
                     help="Selected-columns JSON files whose adjacent arcs must be included.")
     ec.add_argument("--hint-solution", nargs="*", default=[],
-                    help="Selected-columns JSON files to use as CP-SAT solution hints.")
+                    help=("Selected-columns JSON file to use as a CP-SAT solution hint. "
+                          "If multiple files are supplied, only the first is used."))
     ec.add_argument("--require-pricing-kind", default=None,
                     help="Require selected columns to include this pricing metadata key.")
     ec.add_argument("--min-required-pricing", type=int, default=0,
                     help="Minimum selected columns with --require-pricing-kind.")
     ec.add_argument("--require-column-id", default=None,
                     help="Comma-separated exact column ids that must be selected.")
+    ec.add_argument("--require-column-id-prefix", default=None,
+                    help=("Comma-separated column-id prefixes; at least "
+                          "--min-required-column-prefix matching columns must be selected."))
+    ec.add_argument("--min-required-column-prefix", type=int, default=1,
+                    help="Minimum selected columns per --require-column-id-prefix group.")
+    ec.add_argument("--require-column-id-prefix-group", default=None,
+                    help=("Semicolon-separated [LABEL:]MIN:PREFIX|PREFIX groups. "
+                          "At least MIN columns matching any prefix in each group "
+                          "must be selected."))
+    ec.add_argument("--exclude-column-id", default=None,
+                    help="Comma-separated exact column ids to remove from the pool.")
+    ec.add_argument("--exclude-column-id-prefix", default=None,
+                    help="Comma-separated column-id prefixes to remove from the pool.")
+    ec.add_argument("--required-arc-top-k", type=int, default=0,
+                    help=("When columns are required by id, prefix, or pricing kind, "
+                          "exact-price this many "
+                          "extra incoming and outgoing proxy-nearest arcs around "
+                          "each matching row. Useful for "
+                          "forced-column diagnostics without increasing global --top-k."))
+    ec.add_argument("--protected-arc-top-k", type=int, default=0,
+                    help=("When stations or station groups are protected, exact-price "
+                          "this many extra incoming and outgoing proxy-nearest arcs "
+                          "around rows that cover those stations. Useful for small "
+                          "residual-repair diagnostics without forcing specific rows."))
+    ec.add_argument("--protected-row-start-stop", default=None,
+                    help=("Comma-separated start stop ids. When protection is active, "
+                          "rows that cover protected stations but start elsewhere are "
+                          "forbidden. Useful for partitioning broad protected families."))
+    ec.add_argument("--protected-row-column-id-prefix", default=None,
+                    help=("Comma-separated column-id prefixes. When protection is "
+                          "active, rows that cover protected stations but do not match "
+                          "one of these prefixes are forbidden. Combines with "
+                          "--protected-row-start-stop."))
     ec.add_argument("--start-time-window", default=None,
                     help="Restrict the route start column to week-second range START-END.")
     ec.add_argument("--end-time-window", default=None,
                     help="Restrict the route end column to week-second range START-END.")
+    ec.add_argument("--max-total-elapsed", default=None,
+                    help=("Hard cap on modeled column+connector elapsed. Accepts seconds, "
+                          "MM:SS, or HH:MM:SS."))
     ec.add_argument("--column-penalty", type=int, default=0)
     ec.add_argument("--uncovered-penalty-s", type=int, default=0,
                     help=("If positive, allow uncovered stations with this penalty "
                           "instead of enforcing hard coverage. Diagnostic only."))
+    ec.add_argument("--uncovered-penalty-groups", default=None,
+                    help=("Semicolon-separated NAME:PENALTY_SECONDS:station,station "
+                          "groups that add extra objective penalty for leaving "
+                          "listed stations uncovered. Also enables relaxed coverage."))
+    ec.add_argument("--min-covered-count", type=int, default=None,
+                    help=("With relaxed coverage, require at least this many canonical "
+                          "stations to be covered."))
+    ec.add_argument("--protect-stations", default=None,
+                    help=("Comma-separated canonical station ids that must be covered "
+                          "even when --uncovered-penalty-s is used."))
+    ec.add_argument("--protect-stations-file", nargs="*", default=[],
+                    help=("JSON list/object of canonical station ids to protect. "
+                          "Object keys: stations, protected_stations, or "
+                          "relaxed_uncovered_stations."))
+    ec.add_argument("--protect-station-groups", default=None,
+                    help=("Semicolon-separated NAME:MIN:station,station groups. "
+                          "With relaxed coverage, each group must cover at "
+                          "least MIN stations without requiring every station."))
+    ec.add_argument("--order-station-groups", default=None,
+                    help=("Semicolon-separated NAME:MIN:station,station groups. "
+                          "Each group chooses one selected witness row covering "
+                          "at least MIN listed stations, and witness rows must "
+                          "appear in the given order. Diagnostic packet-state "
+                          "constraint."))
+    ec.add_argument("--strict-order-station-groups", action="store_true",
+                    help=("Require ordered station-group witnesses to appear at "
+                          "strictly increasing row positions, so one selected "
+                          "row cannot satisfy adjacent ordered groups."))
+    ec.add_argument("--first-hit-order-station-groups", action="store_true",
+                    help=("Interpret ordered station-group positions as the "
+                          "earliest selected row covering each group's minimum "
+                          "hit threshold. This prevents incidental earlier "
+                          "packet coverage from being ignored."))
     ec.add_argument("--max-columns", type=int, default=0)
     ec.add_argument("--time-limit", type=float, default=60)
     ec.add_argument("--workers", type=int, default=8)
+    ec.add_argument("--stop-after-first-solution", action="store_true",
+                    help=("Stop CP-SAT after the first feasible selected order. "
+                          "Useful for large relaxed diagnostics where any "
+                          "record-capped basin is more informative than proof "
+                          "of optimality."))
     ec.add_argument("--route-out", default=None,
                     help="Also write a route JSON made from exact column slices.")
     ec.add_argument("--validate", action="store_true")
     ec.add_argument("--out", default="reports/optimization_runs/exact_cover_solution.json")
     ec.set_defaults(func=cmd_exact_cover)
+
+    br = sub.add_parser(
+        "block-replace",
+        help="Try one-column replacements of contiguous blocks in a selected column order.")
+    br.add_argument("columns_source",
+                    help="Column JSONL or selected-columns JSON containing replacement rows.")
+    br.add_argument("source_order",
+                    help="Selected-columns JSON or route JSON with meta.selected_order.")
+    br.add_argument("--target-stations", default=None,
+                    help="Comma-separated canonical stations to improve; defaults to uncovered.")
+    br.add_argument("--run-mode", choices=("none", "terminal", "all"), default="terminal",
+                    help="Run policy used for proxy/static candidate screening.")
+    br.add_argument("--terminal-runs", action="store_true",
+                    help="Alias for --run-mode terminal.")
+    br.add_argument("--run-radius", type=float, default=2500)
+    br.add_argument("--validation-radius", type=float, default=5000)
+    br.add_argument("--connector-cap", type=int, default=300000)
+    br.add_argument("--min-covered-count", type=int, default=None,
+                    help="Minimum validated station count to write as an improvement.")
+    br.add_argument("--max-total-elapsed", default=None,
+                    help="Maximum route elapsed; defaults to the source order elapsed.")
+    br.add_argument("--max-candidates", type=int, default=20,
+                    help="Exact-realize this many best proxy replacement candidates.")
+    br.add_argument("--stop-after-first", action="store_true",
+                    help="Stop once a candidate meeting the thresholds is written.")
+    br.add_argument("--route-out",
+                    default="reports/optimization_runs/block_replace_route.json")
+    br.add_argument("--out",
+                    default="reports/optimization_runs/block_replace_summary.json")
+    br.set_defaults(func=cmd_block_replace)
+
+    pair = sub.add_parser(
+        "pair-replace",
+        help="Try two-column replacements of contiguous blocks in a selected column order.")
+    pair.add_argument("columns_source",
+                      help="Column JSONL or selected-columns JSON containing replacement rows.")
+    pair.add_argument("source_order",
+                      help="Selected-columns JSON or route JSON with meta.selected_order.")
+    pair.add_argument("--target-stations", default=None,
+                      help="Comma-separated canonical stations to improve; defaults to uncovered.")
+    pair.add_argument("--column-id-prefix", default=None,
+                      help="Comma-separated prefixes allowed for both replacement columns.")
+    pair.add_argument("--first-column-id-prefix", default=None,
+                      help="Comma-separated prefixes allowed for the first replacement column.")
+    pair.add_argument("--second-column-id-prefix", default=None,
+                      help="Comma-separated prefixes allowed for the second replacement column.")
+    pair.add_argument("--include-non-target-candidates", action="store_true",
+                      help="Allow replacement columns that do not hit current target stations.")
+    pair.add_argument("--max-first-rows", type=int, default=900,
+                      help="Keep this many best first-column candidates after filtering.")
+    pair.add_argument("--max-second-rows", type=int, default=900,
+                      help="Keep this many best second-column candidates after filtering.")
+    pair.add_argument("--min-replace-start-index", type=int, default=1,
+                      help=("First selected-column index that may be removed. "
+                            "Index 0 is preserved as the left route anchor."))
+    pair.add_argument("--max-replace-start-index", type=int, default=0,
+                      help="Last selected-column start index that may be removed; 0 means last.")
+    pair.add_argument("--min-replace-end-index", type=int, default=0,
+                      help="Minimum half-open selected-column end index; 0 means start+1.")
+    pair.add_argument("--max-replace-end-index", type=int, default=0,
+                      help="Maximum half-open selected-column end index; 0 means route end.")
+    pair.add_argument("--min-removed-count", type=int, default=1)
+    pair.add_argument("--max-removed-count", type=int, default=0,
+                      help="Maximum removed selected columns; 0 means no limit.")
+    pair.add_argument("--run-mode", choices=("none", "terminal", "all"), default="terminal",
+                      help="Run policy used for proxy/static candidate screening.")
+    pair.add_argument("--terminal-runs", action="store_true",
+                      help="Alias for --run-mode terminal.")
+    pair.add_argument("--run-radius", type=float, default=2500)
+    pair.add_argument("--validation-radius", type=float, default=5000)
+    pair.add_argument("--connector-cap", type=int, default=300000)
+    pair.add_argument("--min-same-station-gap", type=int, default=120,
+                      help="Drop proxy arcs with too little same-station platform-change slack.")
+    pair.add_argument("--min-opposite-direction-gap", type=int, default=180,
+                      help="Drop proxy arcs with too little opposite-direction slack.")
+    pair.add_argument("--min-covered-count", type=int, default=None,
+                      help="Minimum validated station count to write as an improvement.")
+    pair.add_argument("--max-total-elapsed", default=None,
+                      help="Maximum route elapsed; defaults to the source order elapsed.")
+    pair.add_argument("--max-candidates", type=int, default=20,
+                      help="Exact-realize this many best proxy replacement candidates.")
+    pair.add_argument("--progress-every-starts", type=int, default=0,
+                      help="Print scan progress after this many replacement start indexes.")
+    pair.add_argument("--stop-after-first", action="store_true",
+                      help="Stop once a candidate meeting the thresholds is written.")
+    pair.add_argument("--route-out",
+                      default="reports/optimization_runs/pair_replace_route.json")
+    pair.add_argument("--out",
+                      default="reports/optimization_runs/pair_replace_summary.json")
+    pair.set_defaults(func=cmd_pair_replace)
+
+    chain = sub.add_parser(
+        "chain-replace",
+        help="Beam-screen multi-column replacements of contiguous selected-column blocks.")
+    chain.add_argument("columns_source",
+                       help="Column JSONL or selected-columns JSON containing replacement rows.")
+    chain.add_argument("source_order",
+                       help="Selected-columns JSON or route JSON with meta.selected_order.")
+    chain.add_argument("--replacement-count", type=int, default=3,
+                       help="Number of ordered replacement columns to insert.")
+    chain.add_argument("--target-stations", default=None,
+                       help="Comma-separated canonical stations to improve; defaults to uncovered.")
+    chain.add_argument("--column-id-prefix", default=None,
+                       help="Comma-separated prefixes allowed for replacement columns.")
+    chain.add_argument("--chain-column-id-prefixes", default=None,
+                       help=("Semicolon-separated prefix groups for each replacement "
+                             "position. Each group is a comma-separated list."))
+    chain.add_argument("--include-non-target-candidates", action="store_true",
+                       help="Allow replacement columns that do not hit current target stations.")
+    chain.add_argument("--max-candidate-rows", type=int, default=180,
+                       help="Keep this many best target-ranked rows after filtering.")
+    chain.add_argument("--extra-fast-candidate-rows", type=int, default=0,
+                       help="Also include this many fastest filtered rows.")
+    chain.add_argument("--beam-size", type=int, default=1200,
+                       help="Partial replacement chains retained per block and depth.")
+    chain.add_argument("--keep-proxy-candidates", type=int, default=200,
+                       help="Keep this many best proxy-complete chains before exact replay.")
+    chain.add_argument("--target-reward-s", type=int, default=1800,
+                       help="Beam reward per currently targeted station covered.")
+    chain.add_argument("--cover-reward-s", type=int, default=30,
+                       help="Beam reward per canonical station covered.")
+    chain.add_argument("--time-bucket-s", type=int, default=300,
+                       help="Deduplicate partial states by this elapsed-time bucket.")
+    chain.add_argument("--min-replace-start-index", type=int, default=1,
+                       help=("First selected-column index that may be removed. "
+                             "Index 0 is preserved as the left route anchor."))
+    chain.add_argument("--max-replace-start-index", type=int, default=0,
+                       help="Last selected-column start index that may be removed; 0 means last.")
+    chain.add_argument("--min-replace-end-index", type=int, default=0,
+                       help="Minimum half-open selected-column end index; 0 means start+1.")
+    chain.add_argument("--max-replace-end-index", type=int, default=0,
+                       help="Maximum half-open selected-column end index; 0 means route end.")
+    chain.add_argument("--min-removed-count", type=int, default=1)
+    chain.add_argument("--max-removed-count", type=int, default=0,
+                       help="Maximum removed selected columns; 0 means no limit.")
+    chain.add_argument("--run-mode", choices=("none", "terminal", "all"), default="terminal",
+                       help="Run policy used for proxy/static candidate screening.")
+    chain.add_argument("--terminal-runs", action="store_true",
+                       help="Alias for --run-mode terminal.")
+    chain.add_argument("--run-radius", type=float, default=2500)
+    chain.add_argument("--validation-radius", type=float, default=5000)
+    chain.add_argument("--connector-cap", type=int, default=300000)
+    chain.add_argument("--min-same-station-gap", type=int, default=120,
+                       help="Drop proxy arcs with too little same-station platform-change slack.")
+    chain.add_argument("--min-opposite-direction-gap", type=int, default=180,
+                       help="Drop proxy arcs with too little opposite-direction slack.")
+    chain.add_argument("--min-covered-count", type=int, default=None,
+                       help="Minimum validated station count to write as an improvement.")
+    chain.add_argument("--max-total-elapsed", default=None,
+                       help="Maximum route elapsed; defaults to the source order elapsed.")
+    chain.add_argument("--max-candidates", type=int, default=20,
+                       help="Exact-realize this many best proxy replacement candidates.")
+    chain.add_argument("--progress-every-starts", type=int, default=0,
+                       help="Print scan progress after this many replacement start indexes.")
+    chain.add_argument("--stop-after-first", action="store_true",
+                       help="Stop once a candidate meeting the thresholds is written.")
+    chain.add_argument("--route-out",
+                       default="reports/optimization_runs/chain_replace_route.json")
+    chain.add_argument("--out",
+                       default="reports/optimization_runs/chain_replace_summary.json")
+    chain.set_defaults(func=cmd_chain_replace)
 
     pr = sub.add_parser(
         "price-terminals",
@@ -4337,6 +7741,172 @@ def main(argv=None) -> int:
     pcc.add_argument("--out", default="reports/optimization_runs/seed_columns_cluster_corridors.jsonl")
     pcc.set_defaults(func=cmd_price_cluster_corridors)
 
+    pas = sub.add_parser(
+        "price-anchor-sequences",
+        help="Generate exact columns by forcing explicit ordered station-anchor sequences.")
+    pas.add_argument("--source-columns", required=True,
+                     help="Column JSONL/selected-columns JSON containing the source column.")
+    pas.add_argument("--source-column-id", required=True)
+    pas.add_argument("--source-point", choices=("start", "end"), default="end")
+    pas.add_argument("--base-columns", default=None,
+                     help="Optional existing column pool to copy before generated columns.")
+    pas.add_argument("--anchor-sequences", default=None,
+                     help="Semicolon-separated comma station-id sequences.")
+    pas.add_argument("--anchor-sequences-file", default=None,
+                     help="JSON list of comma strings or station-id lists.")
+    pas.add_argument("--target-stations", default=None,
+                     help="Optional canonical station ids used only for hit metadata/filtering.")
+    pas.add_argument("--run-mode", choices=("none", "terminal", "all"), default="terminal")
+    pas.add_argument("--terminal-runs", action="store_true",
+                     help="Alias for --run-mode terminal.")
+    pas.add_argument("--run-radius", type=float, default=2500)
+    pas.add_argument("--validation-radius", type=float, default=5000)
+    pas.add_argument("--max-end-time", type=int, default=None,
+                     help="Optional absolute week-second cap for generated column end events.")
+    pas.add_argument("--max-elapsed-minutes", type=float, default=240)
+    pas.add_argument("--max-leg-minutes", type=float, default=0)
+    pas.add_argument("--min-covered", type=int, default=4)
+    pas.add_argument("--min-target-hits", type=int, default=0)
+    pas.add_argument("--connector-cap", type=int, default=300000)
+    pas.add_argument("--label", default="priced_anchor_sequence")
+    pas.add_argument("--verbose", action="store_true")
+    pas.add_argument("--out", default="reports/optimization_runs/seed_columns_anchor_sequences.jsonl")
+    pas.set_defaults(func=cmd_price_anchor_sequences)
+
+    psc = sub.add_parser(
+        "price-stage-chains",
+        help="Generate exact columns through ordered resource-stage station groups.")
+    psc.add_argument("--source-columns", required=True,
+                     help="Column JSONL/selected-columns JSON containing the source column.")
+    psc.add_argument("--source-column-id", required=True)
+    psc.add_argument("--source-point", choices=("start", "end"), default="end")
+    psc.add_argument("--base-columns", default=None,
+                     help="Optional existing column pool to copy before generated columns.")
+    psc.add_argument("--stage-groups", default=None,
+                     help="Semicolon-separated comma station-id groups to satisfy in order.")
+    psc.add_argument("--stage-groups-file", default=None,
+                     help="JSON list of comma strings or station-id lists.")
+    psc.add_argument("--stage-min-hits", default=None,
+                     help=("Comma-separated minimum covered stations per stage. "
+                           "One value applies to every stage. Default is 1."))
+    psc.add_argument("--target-stations", default=None,
+                     help="Optional additional canonical station ids to reward.")
+    psc.add_argument("--targets-file", default=None,
+                     help="JSON list or relaxed-master JSON containing relaxed_uncovered_stations.")
+    psc.add_argument("--final-stations", required=True,
+                     help="Comma-separated canonical station ids allowed as generated endpoints.")
+    psc.add_argument("--run-mode", choices=("none", "terminal", "all"), default="terminal")
+    psc.add_argument("--terminal-runs", action="store_true",
+                     help="Alias for --run-mode terminal.")
+    psc.add_argument("--run-radius", type=float, default=2500)
+    psc.add_argument("--validation-radius", type=float, default=5000)
+    psc.add_argument("--max-end-time", type=int, default=None,
+                     help="Optional absolute week-second cap for generated column end events.")
+    psc.add_argument("--max-elapsed-minutes", type=float, default=420)
+    psc.add_argument("--max-leg-minutes", type=float, default=150)
+    psc.add_argument("--max-stage-targets", type=int, default=0,
+                     help="Limit each stage to this many listed stations; 0 allows all.")
+    psc.add_argument("--max-stage-depth", type=int, default=0,
+                     help=("Maximum station-to-station expansions inside each stage. "
+                           "0 uses that stage's minimum hit count."))
+    psc.add_argument("--force-stage-move", action="store_true",
+                     help="Do not let incidental prior coverage satisfy a later stage.")
+    psc.add_argument("--beam-size", type=int, default=120)
+    psc.add_argument("--emit-top", type=int, default=200)
+    psc.add_argument("--emit-frontier-top", type=int, default=0,
+                     help="Also emit this many best satisfied stage-boundary states.")
+    psc.add_argument("--frontier-only", action="store_true",
+                     help="Skip final-station extensions and emit only stage frontiers.")
+    psc.add_argument("--max-generated", type=int, default=0)
+    psc.add_argument("--min-target-hits", type=int, default=4)
+    psc.add_argument("--min-covered", type=int, default=20)
+    psc.add_argument("--frontier-min-target-hits", type=int, default=1,
+                     help="Minimum target hits for emitted stage-frontier states.")
+    psc.add_argument("--frontier-min-covered", type=int, default=1,
+                     help="Minimum covered stations for emitted stage-frontier states.")
+    psc.add_argument("--stage-reward-s", type=float, default=1200.0)
+    psc.add_argument("--target-reward-s", type=float, default=1800.0)
+    psc.add_argument("--cover-reward-s", type=float, default=45.0)
+    psc.add_argument("--column-penalty", type=int, default=0)
+    psc.add_argument("--time-bucket-s", type=int, default=300)
+    psc.add_argument("--max-score-s", type=float, default=None)
+    psc.add_argument("--connector-cap", type=int, default=300000)
+    psc.add_argument("--label", default="priced_stage_chain")
+    psc.add_argument("--out", default="reports/optimization_runs/seed_columns_stage_chains.jsonl")
+    psc.set_defaults(func=cmd_price_stage_chains)
+
+    prc = sub.add_parser(
+        "price-resource-chains",
+        help="Beam-search exact columns with unordered resource-group state.")
+    prc.add_argument("--source-columns", required=True,
+                     help="Column JSONL/selected-columns JSON containing the source column.")
+    prc.add_argument("--source-column-id", required=True)
+    prc.add_argument("--source-point", choices=("start", "end"), default="end")
+    prc.add_argument("--base-columns", default=None,
+                     help="Optional existing column pool to copy before generated columns.")
+    prc.add_argument("--resource-groups", default=None,
+                     help=("Semicolon-separated NAME:station,station resource groups. "
+                           "NAME may also be omitted."))
+    prc.add_argument("--resource-groups-file", default=None,
+                     help=("JSON object name -> stations, or list of objects with "
+                           "name/stations fields."))
+    prc.add_argument("--resource-min-hits", default=None,
+                     help=("Comma-separated minimum covered stations per resource. "
+                           "One value applies to every resource. Default is 1."))
+    prc.add_argument("--require-resources", default=None,
+                     help="Comma-separated resource names that every emitted row must satisfy.")
+    prc.add_argument("--target-stations", default=None,
+                     help="Optional extra canonical stations to reward/expand.")
+    prc.add_argument("--targets-file", default=None,
+                     help="JSON list or relaxed-master JSON containing relaxed_uncovered_stations.")
+    prc.add_argument("--final-stations", required=True,
+                     help="Comma-separated canonical station ids allowed as generated endpoints.")
+    prc.add_argument("--run-mode", choices=("none", "terminal", "all"), default="terminal")
+    prc.add_argument("--terminal-runs", action="store_true",
+                     help="Alias for --run-mode terminal.")
+    prc.add_argument("--run-radius", type=float, default=2500)
+    prc.add_argument("--validation-radius", type=float, default=5000)
+    prc.add_argument("--max-end-time", type=int, default=None,
+                     help="Optional absolute week-second cap for generated column end events.")
+    prc.add_argument("--max-elapsed-minutes", type=float, default=420)
+    prc.add_argument("--max-leg-minutes", type=float, default=150)
+    prc.add_argument("--beam-size", type=int, default=160)
+    prc.add_argument("--max-depth", type=int, default=8)
+    prc.add_argument("--max-expand-targets", type=int, default=32)
+    prc.add_argument("--max-expansions-per-depth", type=int, default=0,
+                     help="Cap exact leg expansions per depth; 0 means no cap.")
+    prc.add_argument("--emit-top", type=int, default=200)
+    prc.add_argument("--emit-frontier-top", type=int, default=0,
+                     help="Also emit this many best non-final beam states as exact columns.")
+    prc.add_argument("--frontier-only", action="store_true",
+                     help="Skip final-station extensions and emit only frontier states.")
+    prc.add_argument("--max-generated", type=int, default=0)
+    prc.add_argument("--min-resource-count", type=int, default=1)
+    prc.add_argument("--min-target-hits", type=int, default=4)
+    prc.add_argument("--min-covered", type=int, default=20)
+    prc.add_argument("--frontier-min-resource-count", type=int, default=None,
+                     help="Minimum satisfied resources for emitted frontier states.")
+    prc.add_argument("--frontier-min-target-hits", type=int, default=None,
+                     help="Minimum target hits for emitted frontier states.")
+    prc.add_argument("--frontier-min-covered", type=int, default=None,
+                     help="Minimum covered stations for emitted frontier states.")
+    prc.add_argument("--resource-reward-s", type=float, default=2400.0)
+    prc.add_argument("--resource-hit-reward-s", type=float, default=600.0)
+    prc.add_argument("--target-reward-s", type=float, default=1200.0)
+    prc.add_argument("--cover-reward-s", type=float, default=45.0)
+    prc.add_argument("--column-penalty", type=int, default=0)
+    prc.add_argument("--time-bucket-s", type=int, default=300)
+    prc.add_argument("--max-score-s", type=float, default=None)
+    prc.add_argument("--connector-cap", type=int, default=300000)
+    prc.add_argument("--resource-chain-cache",
+                     default="reports/optimization_runs/resource_chain_leg_cache.jsonl",
+                     help="Append-only JSONL cache for exact resource-chain leg paths.")
+    prc.add_argument("--no-resource-chain-cache", action="store_true",
+                     help="Disable the resource-chain leg-path cache.")
+    prc.add_argument("--label", default="priced_resource_chain")
+    prc.add_argument("--out", default="reports/optimization_runs/seed_columns_resource_chains.jsonl")
+    prc.set_defaults(func=cmd_price_resource_chains)
+
     plt = sub.add_parser(
         "price-late-tail-beam",
         help="Beam-search exact late-tail columns with station prizes and a hard end-time cap.")
@@ -4386,6 +7956,8 @@ def main(argv=None) -> int:
                      help="Optional existing column pool to copy before split columns.")
     spl.add_argument("--pricing-kind", default=None,
                      help="Only split rows containing this pricing metadata key.")
+    spl.add_argument("--column-id-prefix", default=None,
+                     help="Comma-separated column-id prefixes to split.")
     spl.add_argument("--split-stations", required=True,
                      help="Comma-separated canonical station ids used as split gateways.")
     spl.add_argument("--min-covered", type=int, default=8)

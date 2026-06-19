@@ -83,22 +83,23 @@ The main research direction is documented in
 | Route family | Status |
 |---|---|
 | Best full route | valid `472/472`, `24:24:30` |
-| Best near-record partial | exact replay `454/472`, `22:16:30` |
-| Current target gap | cover the remaining 18 stations without destroying late-middle coverage |
+| Best record-capped partial | exact replay `456/472`, `22:12:30` |
+| Prior over-cap partial | exact replay `456/472`, `22:14:30` |
+| Current target gap | recover the remaining 16 stations under `22:14:10` without destroying coupled route packets |
 
-The strongest current partial route misses:
+The strongest record-capped partial misses:
 
 ```text
-108, 18, 193, 194, 195, 200, 201, 202, 203,
-206, 207, 208, 209, 436, 437, 446, 7, 8
+18, 108, 139, 141, 142, 148, 193, 194, 195,
+200, 201, 202, 203, 253, 436, 437
 ```
 
-That evidence points away from single detours or one huge late suffix. The next
-useful optimization model is a protected multi-corridor column-generation /
-branch-and-price neighborhood: seed from the `454/472` exact partial route,
-protect several existing coverage corridors, price replacement columns with
-exact connector costs and time buckets, then reconstruct and validate any full
-candidate.
+Recent column-generation work shows that these stations are locally reachable,
+but adding them late tends to destroy G/7/Astoria/Flushing, H/Rockaway, M
+branch, Franklin, Harlem, Pelham/Dyre, or final-tail coverage. The next useful
+optimization model is a protected packet-state branch-and-price or macro-route
+generator that prices exact handoffs while carrying several of those resources
+at once.
 
 ### Route summary notebook
 

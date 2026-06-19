@@ -1,17 +1,17 @@
 # Subway Challenge - Codex Optimization Charter
 
 This is the operating brief for Codex in this repository. Treat the checkout as
-a clean starting point for solving the NYC Subway Challenge with **optimization
-methods** over the real MTA schedule data.
+a clean starting point for solving the NYC Subway Challenge with optimization
+methods over the real MTA schedule data.
 
 ## Mission
 
 Use mathematical optimization, solver-backed search, and parallel computation to
-find and validate a route that visits all **472 official NYC subway stations**
-in strictly less than **22:14:10**.
+find and validate a route that visits all 472 official NYC subway stations in
+strictly less than 22:14:10.
 
-The current repository best is **24:24:30**. Improving that baseline is useful,
-but the mission is not complete unless the full validator proves:
+The current repository best is 24:24:30. Improving that baseline is useful, but
+the mission is not complete unless the full validator proves:
 
 ```text
 valid=true
@@ -20,8 +20,8 @@ elapsed_s < 80050
 elapsed < 22:14:10
 ```
 
-A tie does not count. A heuristic estimate does not count. A solver objective
-on a simplified model does not count. Only the full validator decides.
+A tie does not count. A heuristic estimate does not count. A solver objective on
+a simplified model does not count. Only the full validator decides.
 
 ## Clean-Start Rule
 
@@ -58,10 +58,9 @@ Read these files before changing solver behavior:
 Do not weaken the validator, station identity mapping, legal move model, or
 elapsed-time scoring to make a route pass. Improve the route, not the rules.
 
-## Optimization Goal
+## Optimization Abstraction
 
-Cast the problem as solver-friendly models while preserving a path back to the
-real time-expanded graph. The useful abstraction is:
+The useful abstraction is:
 
 > Minimum elapsed-time walk in a cyclic, time-expanded, multimodal graph,
 > visiting every official station label at least once, with incidental station
@@ -74,89 +73,100 @@ schedule.
 
 ## Current Frontier
 
-The long optimization run has not found a record-beating route. The current
-state of knowledge is:
+The multi-day optimization run did not find a record-beating full route. The
+current state is:
 
 ```text
 Best validated full route:      24:24:30, 472/472
 World-record target:            22:14:10, 472/472
-Best near-record partial route: 22:16:30, 454/472
+Best record-capped partial:     22:12:30, 456/472
+Prior over-cap partial:         22:14:30, 456/472
 ```
 
-The best exact partial route is:
+The strongest world-record-capped partial route found during the ignored local
+experiments was:
 
 ```text
-reports/optimization_runs/exact_cover_late_tail_branch_rlocal_04174_exact_top64_route.json
+reports/optimization_runs/exact_cover_anchor_g14_station1_rpacket_7tail_min456_refined_route.json
 ```
 
-Its corresponding selected-column master is:
+It validates/replays at 456/472 stations and 22:12:30, starting `A07N@22020`
+and ending `227S@101970`. Its miss set is:
 
 ```text
-reports/optimization_runs/exact_cover_late_tail_branch_rlocal_04174_exact_top64_require1_relaxed_start21601_end90000.json
+18, 108, 139, 141, 142, 148, 193, 194, 195,
+200, 201, 202, 203, 253, 436, 437
 ```
 
-It validates/replays at `454/472` stations and `22:16:30`. Its missing station
-set is:
+Those `reports/optimization_runs` files are gitignored scratch artifacts, not a
+promoted solution portfolio. If the artifact directory is absent on a fresh
+checkout, reproduce or regenerate the needed pool before using these exact
+paths.
 
-```text
-108, 18, 193, 194, 195, 200, 201, 202, 203,
-206, 207, 208, 209, 436, 437, 446, 7, 8
-```
+## Main Findings To Preserve
 
-Treat this set as the current optimization frontier. It couples Middle Village,
-both Rockaway branches, Manhattan holes around Canal/59 St, Harlem/145, and
-Morris Park. The difficulty is not finding a fast partial route; it is covering
-these stations without destroying coverage that the current late-middle route
-already carries.
+The useful negative result is that the current 456/472 record-capped frontier is
+not missing one cheap station insertion. The remaining stations are coupled
+packets:
 
-## Ruled-Out Families
+| Packet | Stations / role |
+|---|---|
+| F39 / Neptune | `253` |
+| Franklin / Myrtle | `139,141,142` |
+| H / Rockaway | `193-203`, especially the `193-195` and `200-203` split |
+| M branch | `108` plus nearby J/M structure |
+| Harlem / north Manhattan | `148`, `436`, `437` |
+| Earlier route packets | G/7/Astoria/Flushing and final-tail coverage that are easily destroyed |
 
-Do not spend another full session repeating these unless there is a genuinely
-new formulation or new data:
+Important closed branches:
 
-* Randomized incumbent-family LNS and start-grid variants plateau around
-  `24:24:30`.
-* Local splices, shortcut scans, exact endpoint-window replacement, and
-  first-visit reinsertion did not break the incumbent plateau.
-* Phase variants and phase-window variants can be locally faster, but unforced
-  exact masters mostly ignore them; forced variants are worse.
-* Fixed `J31S@87630 -> 227S@101970` final-tail continuation plus an open bridge
-  into J31 is provably stuck at `454/472`.
-* Rockaway split fragments before fixed J31 cover only already-covered trunk
-  stations in the useful exact solution.
-* Later J/M handoffs such as `J31N@89970`, `M12S@90210`, and `J31S@90030`
-  close local residual clusters but lose too much final-tail coverage.
-* Big early all-residual suffixes, such as `A47S@68220 -> 227S@96720` and
-  `S01N@67680 -> 227S@96720`, cover the miss set locally but collapse the
-  master/replay to roughly `394-395/472` because they delete too much unique
-  mid-late coverage.
+- Forcing `253/F39` into B23, B10, F16, D28, G14, D38, and N07 style packets
+  cannot preserve the current 456/472 frontier under the record cap. The first
+  feasible touch-miss model drops to 455/472 by recovering `253` while losing
+  `463/464`.
+- Treat `193-209` as one coupled H/Rockaway resource. Protecting large pieces of
+  it with M-branch and final-tail resources is infeasible in the tested active
+  pools.
+- B14/B23/F36/F26/G35/G24/G22/R03 suffix resource-chain probes cannot produce a
+  strict-cap suffix that preserves both M branch and A/Rockaway-family coverage.
+- R08 is early enough to generate exact M+A/Rockaway resource paths, but the
+  opaque suffix rows are globally destructive. Splitting those rows improves the
+  relaxed basin to roughly 450/472, still below the frontier.
+- G24, G22, and R03 packet-stage generators can make large local
+  F39/tail/H/Rockaway/M rows, but Flushing/Astoria cannot be appended before the
+  record cap and the rows are infeasible in the global relaxed master.
+- The A47 H-first split experiment generated useful Astoria and F39 fragments,
+  but forcing a clean Astoria fragment plus a later F39 fragment was infeasible
+  under 22:14:09 in the current active pool.
 
-Important supporting diagnostics are documented in:
+The practical implication: stop tuning one giant late suffix or one isolated
+station repair. The next serious model has to move the macro order earlier than
+the R/Astoria/R03 knot, or generate complete macro-route candidates with packet
+resources and exact handoff timing inside the pricing problem.
 
-```text
-OPTIMIZATION_STRATEGY.md
-reports/optimization_runs/README.md
-```
+## Useful Tooling Now In The Repo
 
-## Next Continuation Goal
+`subway_challenge.columns` is the main research workbench. Durable capabilities
+added during the optimization run include:
 
-The next useful attack is a protected multi-corridor branch-and-price model:
+- hard elapsed caps for exact-cover via `--max-total-elapsed`;
+- relaxed coverage with `--uncovered-penalty-s` and `--min-covered-count`;
+- extra penalties for critical miss groups via `--uncovered-penalty-groups`;
+- hard and partial protected station groups via `--protect-stations` and
+  `--protect-station-groups`;
+- required column ids, prefixes, prefix groups, pricing kinds, and excluded ids;
+- targeted exact connector pricing around required/protected rows via
+  `--required-arc-top-k` and `--protected-arc-top-k`;
+- bounded replacement screens: `block-replace`, `pair-replace`, and
+  `chain-replace`;
+- exact stage/resource column generators: `price-stage-chains` and
+  `price-resource-chains`;
+- `split-columns` for cutting long schedule-realized rows into smaller
+  subcolumns at gateway stations.
 
-1. Start from the `454/472` exact partial route as the incumbent/hint.
-2. Protect multiple coverage corridors at once, not only a final suffix.
-3. Price replacement columns for the coverage lost before any earlier suffix
-   handoff, especially the 7/F/G/Brooklyn and other middle-late blocks that the
-   all-residual suffixes delete.
-4. Generate alternative final-tail continuations and handoff states together,
-   using exact connector costs and time buckets.
-5. Use stabilized set-partitioning/column-generation ideas: dual smoothing,
-   resource-constrained shortest-path pricing, and dynamic time-state
-   refinement.
-
-In practical repo terms: build small exact neighborhoods that can prove or
-disprove multi-column replacements around the late middle of the route. A
-single huge suffix or a single Rockaway patch is no longer the right unit of
-search.
+See `OPTIMIZATION_STRATEGY.md` for how these tools fit together. Keep generated
+JSONL/JSON artifacts under `reports/optimization_runs/` unless they become
+small, documented, and intentionally promoted.
 
 ## Available External Capabilities
 
@@ -165,54 +175,37 @@ Never print secret values.
 
 Smoke-tested capabilities:
 
-* `NEOS_EMAIL` works for NEOS XML-RPC submissions. A tiny `milp:Cbc:AMPL` job
+- `NEOS_EMAIL` works for NEOS XML-RPC submissions. A tiny `milp:Cbc:AMPL` job
   was submitted and solved successfully.
-* `NVIDIA_API_KEY` works against NVIDIA endpoints, and the account can see the
+- `NVIDIA_API_KEY` works against NVIDIA endpoints, and the account can see the
   active `ai-nvidia-cuopt` function.
-* `OPT_ARTIFACT_DIR` is writable and defaults to `reports/optimization_runs`.
-* OR-Tools is installed locally.
+- `OPT_ARTIFACT_DIR` is writable and defaults to `reports/optimization_runs`.
+- OR-Tools is installed locally.
 
 Current caveats:
 
-* Python's default SSL certificate discovery may fail on this machine. Use
+- Python's default SSL certificate discovery may fail on this machine. Use
   `certifi` explicitly for HTTPS/XML-RPC clients.
-* Local AMPL, `amplpy`, Gurobi, CPLEX, and MOSEK are not currently installed or
+- Local AMPL, `amplpy`, Gurobi, CPLEX, and MOSEK are not currently installed or
   configured unless `.env` is updated.
 
-## Preferred Architecture
+## Next Continuation Goal
 
-Build optimization infrastructure in layers:
+Build a protected packet-state branch-and-price or macro-route generator that:
 
-1. **Transition oracle.** Given a start event and target station/block, return
-   earliest-arrival path, elapsed time, modes, and incidentally covered stations.
-   Cache aggressively.
-2. **Compact/macro model.** Work on terminal blocks, branch blocks, decision
-   nodes, and time buckets before trying huge models.
-3. **Solver model.** Export ATSP/GTSP/MIP/CP-SAT/column-generation pilots to
-   OR-Tools, NEOS, cuOpt, SCIP/HiGHS/Gurobi, or AMPL as available.
-4. **Route reconstruction.** Convert solver macro orders or selected columns
-   back into concrete path JSON.
-5. **Validation and promotion.** Validate with `solver.py`; promote only useful
-   candidate milestones into `solutions/`.
+1. starts before the R/Astoria/R03 commitment point or changes the macro route
+   order before that phase;
+2. carries packet resources for F39, H/Rockaway, M branch, G/7/Astoria/Flushing,
+   Franklin, Harlem, and final tail;
+3. prices exact event-to-event handoffs during generation rather than after a
+   loose master has selected rows;
+4. can emit complete route candidates or compatible staged columns with shared
+   resource states;
+5. reconstructs every promising output into route JSON and validates it with
+   `solver.py`.
 
-## Search Priorities
-
-Prefer optimization work that can change the macro route shape:
-
-* Protected multi-corridor set-partitioning/column-generation models where
-  columns are schedule-realized path segments that cover station sets.
-* Resource-constrained shortest-path pricing for replacement fragments around
-  the late-middle route, especially fragments that recover coverage lost by
-  earlier all-residual suffixes.
-* Dynamic discretization: solve on sparse time buckets, then add event times
-  where the incumbent route, exact connector costs, or duals show pressure.
-* Time-bucketed ATSP/GTSP over station or branch-block orders.
-* cuOpt/OR-Tools/Gurobi-style matrix routing as fast macro-order generators.
-* NEOS/AMPL/Pyomo experiments for compact MILP/CP formulations and lower bounds.
-* Parallel LNS portfolios seeded by solver-generated macro orders.
-
-Avoid spending a full session only on blind local polishing around the incumbent
-unless it tests a concrete optimizer-generated hypothesis.
+Avoid another full session of blind LNS, local shortcut scans, or single-suffix
+column tuning unless it tests a concrete solver-generated hypothesis.
 
 ## Validation Contract
 
